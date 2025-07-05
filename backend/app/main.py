@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.staticfiles import StaticFiles
 from app.config import get_settings
 from app.database import create_tables
 from app.api import auth, social_media
@@ -22,6 +23,17 @@ app = FastAPI(
     docs_url="/docs" if settings.debug else None,
     redoc_url="/redoc" if settings.debug else None,
 )
+
+# Mount static files for serving generated images
+import os
+from pathlib import Path
+
+# Create temp_images directory if it doesn't exist
+temp_images_path = Path("temp_images")
+temp_images_path.mkdir(exist_ok=True)
+
+# Mount the static files
+app.mount("/temp_images", StaticFiles(directory="temp_images"), name="temp_images")
 
 # Add CORS middleware
 app.add_middleware(
@@ -132,6 +144,10 @@ app.include_router(social_media.router, prefix="/api")
 # Import and include AI router
 from app.api import ai
 app.include_router(ai.router, prefix="/api")
+
+# Import and include Google Drive router
+from app.api import google_drive
+app.include_router(google_drive.router)
 
 
 # Error handlers

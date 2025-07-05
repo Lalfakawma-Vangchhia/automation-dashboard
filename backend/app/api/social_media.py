@@ -15,9 +15,115 @@ from app.schemas.social_media import (
     InstagramConnectRequest, InstagramPostRequest, InstagramAccountInfo,
     SuccessResponse, ErrorResponse
 )
+from pydantic import BaseModel, Field, validator, model_validator
 from datetime import datetime
 import logging
 from app.services.instagram_service import instagram_service
+
+
+# Image Generation Request Models
+class ImageGenerationRequest(BaseModel):
+    """Request model for image generation."""
+    image_prompt: str = Field(..., min_length=1, max_length=500, description="Prompt for image generation")
+    post_type: str = Field(default="feed", description="Type of post for sizing (feed, story, square, etc.)")
+
+
+# Unified Facebook post request model
+class UnifiedFacebookPostRequest(BaseModel):
+    """Unified request model for creating Facebook posts with various options."""
+    page_id: str = Field(..., description="Facebook page ID")
+    text_content: Optional[str] = Field(None, description="Text content for the post (if not using AI generation)")
+    content_prompt: Optional[str] = Field(None, description="Prompt for AI text generation")
+    image_prompt: Optional[str] = Field(None, description="Prompt for AI image generation")
+    image_url: Optional[str] = Field(None, description="URL of existing image to use")
+    image_filename: Optional[str] = Field(None, description="Filename of existing image")
+    video_url: Optional[str] = Field(None, description="URL of existing video to use (base64 data URL)")
+    video_filename: Optional[str] = Field(None, description="Filename of existing video")
+    post_type: str = Field(default="feed", description="Type of post for sizing")
+    use_ai_text: bool = Field(default=False, description="Whether to generate text using AI")
+    use_ai_image: bool = Field(default=False, description="Whether to generate image using AI")
+    
+    @model_validator(mode='after')
+    def validate_content_requirements(self):
+        """Ensure at least one content source is provided."""
+        text_content = self.text_content
+        content_prompt = self.content_prompt
+        image_url = self.image_url
+        image_prompt = self.image_prompt
+        video_url = self.video_url
+        
+        # Check if we have any content
+        has_text = text_content and text_content.strip()
+        has_content_prompt = content_prompt and content_prompt.strip()
+        has_image_url = image_url and image_url.strip()
+        has_image_prompt = image_prompt and image_prompt.strip()
+        has_video_url = video_url and video_url.strip()
+        
+        if not any([has_text, has_content_prompt, has_image_url, has_image_prompt, has_video_url]):
+            raise ValueError("At least one of text_content, content_prompt, image_url, image_prompt, or video_url must be provided")
+        
+        return self
+
+
+# Instagram Image Generation Request Models
+class InstagramImageGenerationRequest(BaseModel):
+    """Request model for Instagram image generation."""
+    image_prompt: str = Field(..., min_length=1, max_length=500, description="Prompt for image generation")
+    post_type: str = Field(default="feed", description="Type of post for sizing (feed, story, square, etc.)")
+
+
+# Instagram Carousel Generation Request Models
+class InstagramCarouselGenerationRequest(BaseModel):
+    """Request model for Instagram carousel generation."""
+    image_prompt: str = Field(..., min_length=1, max_length=500, description="Prompt for carousel images")
+    count: int = Field(default=3, ge=3, le=7, description="Number of images to generate (3-7)")
+    post_type: str = Field(default="feed", description="Type of post for sizing (feed, story, square, etc.)")
+
+
+# Instagram Carousel Post Request Models
+class InstagramCarouselPostRequest(BaseModel):
+    """Request model for Instagram carousel posting."""
+    instagram_user_id: str = Field(..., description="Instagram user ID")
+    caption: str = Field(..., min_length=1, max_length=2200, description="Caption for the carousel")
+    image_urls: List[str] = Field(..., min_items=3, max_items=7, description="List of image URLs (3-7 images)")
+
+
+# Unified Instagram post request model
+class UnifiedInstagramPostRequest(BaseModel):
+    """Unified request model for creating Instagram posts with various options."""
+    instagram_user_id: str = Field(..., description="Instagram user ID")
+    caption: Optional[str] = Field(None, description="Text caption for the post")
+    content_prompt: Optional[str] = Field(None, description="Prompt for AI text generation")
+    image_prompt: Optional[str] = Field(None, description="Prompt for AI image generation")
+    image_url: Optional[str] = Field(None, description="URL of existing image to use")
+    image_filename: Optional[str] = Field(None, description="Filename of existing image")
+    video_url: Optional[str] = Field(None, description="URL of existing video to use (base64 data URL)")
+    video_filename: Optional[str] = Field(None, description="Filename of existing video")
+    post_type: str = Field(default="feed", description="Type of post for sizing")
+    use_ai_text: bool = Field(default=False, description="Whether to generate text using AI")
+    use_ai_image: bool = Field(default=False, description="Whether to generate image using AI")
+    media_type: str = Field(default="image", description="Type of media (image, video, carousel)")
+    
+    @model_validator(mode='after')
+    def validate_content_requirements(self):
+        """Ensure at least one content source is provided."""
+        caption = self.caption
+        content_prompt = self.content_prompt
+        image_url = self.image_url
+        image_prompt = self.image_prompt
+        video_url = self.video_url
+        
+        # Check if we have any content
+        has_caption = caption and caption.strip()
+        has_content_prompt = content_prompt and content_prompt.strip()
+        has_image_url = image_url and image_url.strip()
+        has_image_prompt = image_prompt and image_prompt.strip()
+        has_video_url = video_url and video_url.strip()
+        
+        if not any([has_caption, has_content_prompt, has_image_url, has_image_prompt, has_video_url]):
+            raise ValueError("At least one of caption, content_prompt, image_url, image_prompt, or video_url must be provided")
+        
+        return self
 
 router = APIRouter(prefix="/social", tags=["social media"])
 
@@ -515,13 +621,67 @@ async def create_facebook_post(
         )
 
 
+@router.get("/facebook/posts-for-auto-reply/{page_id}")
+async def get_posts_for_auto_reply(
+    page_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get posts from this app for auto-reply selection."""
+    try:
+        # Find the Facebook account/page
+        account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "facebook",
+            SocialAccount.platform_user_id == page_id
+        ).first()
+        
+        if not account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Facebook page not found"
+            )
+        
+        # Get posts created by this app for this page
+        posts = db.query(Post).filter(
+            Post.social_account_id == account.id,
+            Post.status.in_([PostStatus.PUBLISHED, PostStatus.SCHEDULED])
+        ).order_by(Post.created_at.desc()).limit(50).all()
+        
+        # Format posts for frontend
+        formatted_posts = []
+        for post in posts:
+            formatted_posts.append({
+                "id": post.id,
+                "facebook_post_id": post.platform_post_id,
+                "content": post.content[:200] + "..." if len(post.content) > 200 else post.content,
+                "full_content": post.content,
+                "created_at": post.created_at.isoformat(),
+                "status": post.status.value,
+                "has_media": bool(post.media_urls),
+                "media_count": len(post.media_urls) if post.media_urls else 0
+            })
+        
+        return {
+            "success": True,
+            "posts": formatted_posts,
+            "total_count": len(formatted_posts)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to get posts for auto-reply: {str(e)}"
+        )
+
+
 @router.post("/facebook/auto-reply")
 async def toggle_auto_reply(
     request: AutoReplyToggleRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Toggle auto-reply for Facebook page with AI integration (replaces Make.com webhook)."""
+    """Toggle auto-reply for Facebook page with AI integration and post selection."""
     try:
         # Import Facebook service
         from app.services.facebook_service import facebook_service
@@ -538,6 +698,23 @@ async def toggle_auto_reply(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Facebook page not found"
             )
+        
+        # Validate selected posts if any
+        selected_posts = []
+        if request.selected_post_ids:
+            posts = db.query(Post).filter(
+                Post.id.in_(request.selected_post_ids),
+                Post.social_account_id == account.id
+            ).all()
+            # Get the Facebook post IDs (platform_post_id) for the selected posts
+            selected_posts = [post.platform_post_id for post in posts if post.platform_post_id]
+            
+            logger.info(f"Selected posts: {request.selected_post_ids}")
+            logger.info(f"Facebook post IDs: {selected_posts}")
+            logger.info(f"Found posts in DB: {[post.id for post in posts]}")
+            logger.info(f"Platform post IDs: {[post.platform_post_id for post in posts]}")
+        else:
+            logger.info("No selected post IDs in request")
         
         # Use Facebook service to setup auto-reply
         facebook_result = await facebook_service.setup_auto_reply(
@@ -557,30 +734,43 @@ async def toggle_auto_reply(
         if auto_reply_rule:
             # Update existing rule
             auto_reply_rule.is_active = request.enabled
-            auto_reply_rule.actions = {
+            rule_actions = {
                 "response_template": request.response_template,
                 "ai_enabled": True,
-                "facebook_setup": facebook_result
+                "facebook_setup": facebook_result,
+                "selected_post_ids": request.selected_post_ids,
+                "selected_facebook_post_ids": selected_posts
             }
+            auto_reply_rule.actions = rule_actions
+            logger.info(f"🔄 Updated existing rule {auto_reply_rule.id} with actions: {rule_actions}")
         else:
             # Create new auto-reply rule
+            rule_actions = {
+                "response_template": request.response_template,
+                "ai_enabled": True,
+                "facebook_setup": facebook_result,
+                "selected_post_ids": request.selected_post_ids,
+                "selected_facebook_post_ids": selected_posts
+            }
             auto_reply_rule = AutomationRule(
                 user_id=current_user.id,
                 social_account_id=account.id,
                 name=f"Auto Reply - {account.display_name}",
                 rule_type=RuleType.AUTO_REPLY,
                 trigger_type=TriggerType.ENGAGEMENT_BASED,
-                trigger_conditions={"event": "comment"},
-                actions={
-                    "response_template": request.response_template,
-                    "ai_enabled": True,
-                    "facebook_setup": facebook_result
+                trigger_conditions={
+                    "event": "comment",
+                    "selected_posts": selected_posts
                 },
+                actions=rule_actions,
                 is_active=request.enabled
             )
             db.add(auto_reply_rule)
+            logger.info(f"🆕 Created new rule with actions: {rule_actions}")
         
         db.commit()
+        logger.info(f"💾 Committed rule to database. Rule ID: {auto_reply_rule.id}")
+        logger.info(f"💾 Final rule actions: {auto_reply_rule.actions}")
         
         return SuccessResponse(
             message=f"Auto-reply {'enabled' if request.enabled else 'disabled'} successfully with AI integration",
@@ -589,7 +779,9 @@ async def toggle_auto_reply(
                 "enabled": request.enabled,
                 "ai_enabled": True,
                 "page_name": account.display_name,
-                "facebook_setup": facebook_result
+                "facebook_setup": facebook_result,
+                "selected_posts_count": len(selected_posts),
+                "selected_post_ids": request.selected_post_ids
             }
         )
         
@@ -699,6 +891,289 @@ async def refresh_facebook_tokens(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to refresh tokens: {str(e)}"
+        )
+
+
+# Facebook Image Generation Endpoints
+@router.post("/facebook/generate-image")
+async def generate_facebook_image(
+    request: ImageGenerationRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate an image using Stability AI for Facebook posts.
+    
+    This endpoint generates an image without posting it to Facebook.
+    Use this to preview images before posting.
+    """
+    try:
+        from app.services.facebook_service import facebook_service
+        
+        logger.info(f"Generating image for user {current_user.id} with prompt: {request.image_prompt}")
+        
+        # Generate image
+        result = await facebook_service.generate_image_only(
+            image_prompt=request.image_prompt,
+            post_type=request.post_type
+        )
+        
+        if result["success"]:
+            logger.info(f"Image generated successfully for user {current_user.id}")
+            return {
+                "success": True,
+                "message": "Image generated successfully",
+                "data": {
+                    "image_url": result["image_url"],
+                    "filename": result["filename"],
+                    "prompt": result["prompt"],
+                    "image_details": result["image_details"]
+                }
+            }
+        else:
+            logger.error(f"Image generation failed for user {current_user.id}: {result.get('error')}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image generation failed: {result.get('error')}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in image generation endpoint: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate image: {str(e)}"
+        )
+
+
+@router.post("/facebook/create-post")
+async def create_unified_facebook_post(
+    request: UnifiedFacebookPostRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Simplified endpoint for creating Facebook posts with enhanced error logging.
+    """
+    try:
+        from app.services.facebook_service import facebook_service
+        
+        logger.info(f"=== FACEBOOK POST DEBUG START ===")
+        logger.info(f"User ID: {current_user.id}")
+        logger.info(f"Request data: {request.dict()}")
+        
+        # Verify the user has access to the specified page
+        page_account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "facebook",
+            SocialAccount.platform_user_id == request.page_id,
+            SocialAccount.is_connected == True
+        ).first()
+        
+        if not page_account:
+            logger.error(f"Page not found or not connected for user {current_user.id}, page_id: {request.page_id}")
+            raise HTTPException(
+                status_code=404,
+                detail="Facebook page not found or not connected"
+            )
+        
+        logger.info(f"Found page account: {page_account.display_name} (ID: {page_account.id})")
+        logger.info(f"Page access token length: {len(page_account.access_token) if page_account.access_token else 0}")
+        
+        # Determine content
+        final_text_content = None
+        final_image_url = None
+        
+        # Handle text content
+        if request.use_ai_text or request.content_prompt:
+            logger.info("Generating AI text content")
+            from app.services.groq_service import groq_service
+            text_result = await groq_service.generate_facebook_post(
+                request.content_prompt or request.text_content or "Create an engaging Facebook post"
+            )
+            
+            if not text_result["success"]:
+                logger.error(f"AI text generation failed: {text_result.get('error')}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Text generation failed: {text_result.get('error', 'Unknown error')}"
+                )
+            
+            final_text_content = text_result["content"]
+            logger.info(f"Generated text content: {final_text_content[:100]}...")
+        else:
+            final_text_content = request.text_content
+            logger.info(f"Using provided text content: {final_text_content[:100] if final_text_content else 'None'}...")
+        
+        # Handle image content
+        final_image_url = None
+        if request.use_ai_image or request.image_prompt:
+            logger.info("Generating AI image content")
+            image_result = await facebook_service.generate_image_only(
+                image_prompt=request.image_prompt or request.content_prompt or request.text_content,
+                post_type=request.post_type
+            )
+            
+            if not image_result["success"]:
+                logger.error(f"AI image generation failed: {image_result.get('error')}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Image generation failed: {image_result.get('error', 'Unknown error')}"
+                )
+            
+            final_image_url = image_result["image_url"]
+            logger.info(f"Generated image URL: {final_image_url[:100] if final_image_url else 'None'}...")
+        elif request.image_url:
+            final_image_url = request.image_url
+            logger.info(f"Using provided image URL: {final_image_url[:100] if final_image_url else 'None'}...")
+        
+        # Handle video content
+        final_video_url = None
+        if request.video_url:
+            final_video_url = request.video_url
+            logger.info(f"Using provided video URL: {final_video_url[:100] if final_video_url else 'None'}...")
+        
+        # Determine post type
+        if final_video_url:
+            post_type = "video"
+        elif final_image_url:
+            post_type = "photo"
+        else:
+            post_type = "text"
+        logger.info(f"Post type determined: {post_type}")
+        logger.info(f"Final text content: {final_text_content}")
+        logger.info(f"Final image URL: {final_image_url}")
+        logger.info(f"Final video URL: {final_video_url}")
+        
+        # Create the Facebook post using the service directly
+        logger.info(f"Calling Facebook service create_post method")
+        logger.info(f"Parameters: page_id={request.page_id}, message={final_text_content[:50] if final_text_content else 'None'}..., media_url={final_image_url[:50] if final_image_url else 'None'}..., media_type={post_type}")
+        
+        # Determine which media URL to use
+        media_url = final_video_url if final_video_url else final_image_url
+        
+        result = await facebook_service.create_post(
+            page_id=request.page_id,
+            access_token=page_account.access_token,
+            message=final_text_content or "Generated with AI",
+            media_url=media_url,
+            media_type=post_type
+        )
+        
+        logger.info(f"Facebook service result: {result}")
+        
+        if result["success"]:
+            # Save post to database
+            post = None  # Initialize post variable
+            try:
+                logger.info("Saving post to database...")
+                # Determine post type for database
+                db_post_type = PostType.TEXT
+                media_urls = []
+                
+                if final_video_url:
+                    db_post_type = PostType.VIDEO
+                    media_urls = [final_video_url]
+                elif final_image_url:
+                    db_post_type = PostType.IMAGE
+                    media_urls = [final_image_url]
+                
+                post = Post(
+                    user_id=current_user.id,
+                    social_account_id=page_account.id,
+                    post_type=db_post_type,
+                    content=final_text_content or "Media post",  # Ensure content is never None
+                    platform_post_id=result["post_id"],
+                    status=PostStatus.PUBLISHED,
+                    published_at=datetime.utcnow(),
+                    media_urls=media_urls if media_urls else None,
+                    platform_response={
+                        "facebook_result": result,
+                        "metadata": {
+                            "post_type": request.post_type,
+                            "ai_generated_text": request.use_ai_text or bool(request.content_prompt),
+                            "ai_generated_image": request.use_ai_image or bool(request.image_prompt)
+                        }
+                    }
+                )
+                logger.info(f"Post object created: {post}")
+                db.add(post)
+                db.commit()
+                logger.info(f"Post saved to database with ID: {post.id}")
+            except Exception as db_error:
+                logger.error(f"Database error while saving post: {db_error}")
+                logger.error(f"Post data: user_id={current_user.id}, social_account_id={page_account.id}, content={final_text_content or 'Image post'}")
+                import traceback
+                logger.error(f"Database error traceback: {traceback.format_exc()}")
+                # Don't fail the whole request if database save fails
+                logger.warning("Continuing without database save due to error")
+            
+            logger.info(f"=== FACEBOOK POST SUCCESS ===")
+            
+            return {
+                "success": True,
+                "message": "Facebook post created successfully",
+                "data": {
+                    "post_id": result["post_id"],
+                    "text_content": final_text_content,
+                    "image_url": final_image_url,
+                    "video_url": final_video_url,
+                    "database_id": post.id if post else None  # Handle case where post wasn't saved
+                }
+            }
+        else:
+            # Enhanced error logging
+            error_msg = result.get('error', 'Unknown error')
+            logger.error(f"=== FACEBOOK POST FAILED ===")
+            logger.error(f"Error message: {error_msg}")
+            logger.error(f"Full result: {result}")
+            logger.error(f"Page ID: {request.page_id}")
+            logger.error(f"Access token valid: {bool(page_account.access_token)}")
+            logger.error(f"Image URL type: {type(final_image_url)}")
+            logger.error(f"Image URL preview: {final_image_url[:100] if final_image_url else 'None'}...")
+            
+            # Provide specific error messages for common issues
+            if "PHOTO" in error_msg:
+                detailed_error = (
+                    "Facebook photo upload failed. This could be due to:\n"
+                    "1. Image format not supported (use JPG, PNG, GIF)\n"
+                    "2. Image file too large (max 4MB)\n"
+                    "3. Page doesn't have photo posting permissions\n"
+                    "4. Access token doesn't have required permissions\n"
+                    "5. Facebook API rate limiting\n\n"
+                    f"Technical error: {error_msg}"
+                )
+                raise HTTPException(status_code=400, detail=detailed_error)
+            elif "permission" in error_msg.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Permission error: {error_msg}. Please check your Facebook page permissions."
+                )
+            elif "token" in error_msg.lower() or "expired" in error_msg.lower():
+                # Mark account as disconnected
+                page_account.is_connected = False
+                db.commit()
+                raise HTTPException(
+                    status_code=401,
+                    detail="Facebook access token expired. Please reconnect your account."
+                )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to create post: {error_msg}"
+                )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"=== UNEXPECTED ERROR ===")
+        logger.error(f"Error creating Facebook post: {e}")
+        logger.error(f"Exception type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
         )
 
 
@@ -986,6 +1461,492 @@ async def get_instagram_media(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get Instagram media: {str(e)}"
+        )
+
+
+@router.post("/instagram/generate-image")
+async def generate_instagram_image(
+    request: InstagramImageGenerationRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate an image for Instagram using Stability AI."""
+    try:
+        from app.services.instagram_service import instagram_service
+        from app.services.cloudinary_service import cloudinary_service
+        
+        logger.info(f"Generating Instagram image with prompt: {request.image_prompt}")
+        
+        # Generate image using Instagram-optimized Stability AI
+        image_result = await instagram_service.generate_instagram_image_with_ai(
+            prompt=request.image_prompt,
+            post_type=request.post_type
+        )
+        
+        if not image_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image generation failed: {image_result.get('error', 'Unknown error')}"
+            )
+        
+        # Upload to Cloudinary with Instagram-specific transforms
+        upload_result = cloudinary_service.upload_image_with_instagram_transform(
+            f"data:image/png;base64,{image_result['image_base64']}"
+        )
+        
+        if not upload_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image upload failed: {upload_result.get('error', 'Unknown error')}"
+            )
+        
+        return SuccessResponse(
+            message="Instagram image generated successfully",
+            data={
+                "image_url": upload_result["url"],
+                "filename": f"instagram_generated_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg",
+                "prompt": request.image_prompt,
+                "enhanced_prompt": image_result.get("enhanced_prompt"),
+                "post_type": request.post_type,
+                "width": image_result.get("width"),
+                "height": image_result.get("height")
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating Instagram image: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate Instagram image: {str(e)}"
+        )
+
+
+@router.post("/instagram/upload-image")
+async def upload_instagram_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Upload an image for Instagram using Cloudinary with Instagram-specific transforms."""
+    try:
+        from app.services.cloudinary_service import cloudinary_service
+        
+        # Validate file type
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(
+                status_code=400,
+                detail="Only image files are allowed"
+            )
+        
+        # Read file content
+        file_content = await file.read()
+        
+        # Upload to Cloudinary with Instagram-specific transforms
+        upload_result = cloudinary_service.upload_image_with_instagram_transform(file_content)
+        
+        if not upload_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image upload failed: {upload_result.get('error', 'Unknown error')}"
+            )
+        
+        return SuccessResponse(
+            message="Image uploaded successfully for Instagram",
+            data={
+                "url": upload_result["url"],
+                "filename": file.filename,
+                "size": len(file_content)
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading Instagram image: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload Instagram image: {str(e)}"
+        )
+
+
+@router.post("/instagram/upload-video")
+async def upload_instagram_video(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Upload a video for Instagram using Cloudinary."""
+    try:
+        from app.services.cloudinary_service import cloudinary_service
+        
+        # Validate file type
+        if not file.content_type.startswith('video/'):
+            raise HTTPException(
+                status_code=400,
+                detail="Only video files are allowed"
+            )
+        
+        # Read file content
+        file_content = await file.read()
+        
+        # Upload to Cloudinary (you might want to add video-specific transforms)
+        upload_result = cloudinary_service.upload_video_with_instagram_transform(file_content)
+        
+        if not upload_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Video upload failed: {upload_result.get('error', 'Unknown error')}"
+            )
+        
+        return SuccessResponse(
+            message="Video uploaded successfully for Instagram",
+            data={
+                "url": upload_result["url"],
+                "filename": file.filename,
+                "size": len(file_content)
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading Instagram video: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload Instagram video: {str(e)}"
+        )
+
+
+@router.post("/instagram/generate-caption")
+async def generate_instagram_caption(
+    request: dict,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate Instagram caption using AI."""
+    try:
+        from app.services.groq_service import groq_service
+        
+        prompt = request.get("prompt", "")
+        if not prompt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Prompt is required for caption generation"
+            )
+        
+        result = await groq_service.generate_instagram_post(prompt)
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Caption generation failed: {result.get('error', 'Unknown error')}"
+            )
+        
+        return {
+            "success": True,
+            "content": result["content"],
+            "prompt": prompt
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating Instagram caption: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate caption: {str(e)}"
+        )
+
+
+@router.post("/instagram/generate-carousel")
+async def generate_instagram_carousel(
+    request: InstagramCarouselGenerationRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate Instagram carousel images using AI."""
+    try:
+        result = await instagram_service.generate_carousel_images_with_ai(
+            prompt=request.image_prompt,
+            count=request.count,
+            post_type=request.post_type
+        )
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Carousel generation failed: {result.get('error', 'Unknown error')}"
+            )
+        
+        return {
+            "success": True,
+            "image_urls": result["image_urls"],
+            "caption": result["caption"],
+            "count": result["count"],
+            "prompt": result["prompt"],
+            "width": result["width"],
+            "height": result["height"],
+            "post_type": result["post_type"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating Instagram carousel: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate carousel: {str(e)}"
+        )
+
+
+@router.post("/instagram/post-carousel")
+async def create_instagram_carousel_post(
+    request: InstagramCarouselPostRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create an Instagram carousel post."""
+    try:
+        logger.info(f"Starting Instagram carousel post creation for user {current_user.id}")
+        logger.info(f"Request data: instagram_user_id={request.instagram_user_id}, caption_length={len(request.caption)}, image_count={len(request.image_urls)}")
+        # Find the Instagram account
+        account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "instagram",
+            SocialAccount.platform_user_id == request.instagram_user_id
+        ).first()
+        
+        if not account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Instagram account not found"
+            )
+        
+        # Get the page access token from platform_data
+        page_access_token = account.platform_data.get("page_access_token")
+        if not page_access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Page access token not found. Please reconnect your Instagram account."
+            )
+        
+        # Create the carousel post
+        result = await instagram_service.create_carousel_post(
+            instagram_user_id=request.instagram_user_id,
+            page_access_token=page_access_token,
+            caption=request.caption,
+            image_urls=request.image_urls
+        )
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to create carousel post: {result.get('error', 'Unknown error')}"
+            )
+        
+        # Save post to database
+        post = Post(
+            user_id=current_user.id,
+            social_account_id=account.id,
+            content=request.caption,
+            post_type=PostType.CAROUSEL,
+            status=PostStatus.PUBLISHED,
+            platform_post_id=result.get("post_id"),
+            published_at=datetime.utcnow(),
+            media_urls=request.image_urls
+        )
+        
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        
+        return SuccessResponse(
+            message="Instagram carousel post created successfully",
+            data={
+                "post_id": result.get("post_id"),
+                "database_id": post.id,
+                "platform": "instagram",
+                "account_username": account.username,
+                "caption": request.caption,
+                "image_count": len(request.image_urls),
+                "media_type": "carousel"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating Instagram carousel post: {str(e)}", exc_info=True)
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create carousel post: {str(e)}"
+        )
+
+
+@router.post("/instagram/create-post")
+async def create_unified_instagram_post(
+    request: UnifiedInstagramPostRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create an Instagram post with unified options (AI generation, file upload, etc.)."""
+    try:
+        # Debug logging
+        logger.info(f"Received Instagram post request: {request}")
+        logger.info(f"Request data: instagram_user_id={request.instagram_user_id}, "
+                   f"caption={request.caption}, image_url={request.image_url}, "
+                   f"video_url={request.video_url}, media_type={request.media_type}")
+        # Find the Instagram account
+        account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "instagram",
+            SocialAccount.platform_user_id == request.instagram_user_id
+        ).first()
+        
+        if not account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Instagram account not found"
+            )
+        
+        # Get the page access token from platform_data
+        page_access_token = account.platform_data.get("page_access_token")
+        if not page_access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Page access token not found. Please reconnect your Instagram account."
+            )
+        
+        # Initialize variables
+        final_caption = request.caption
+        final_image_url = request.image_url
+        final_video_url = request.video_url
+        post_result = None
+        
+        logger.info(f"Initial values - caption: {final_caption}, image_url: {final_image_url}, video_url: {final_video_url}")
+        
+        # Step 1: Generate AI text content if requested
+        if request.use_ai_text and request.content_prompt:
+            logger.info("Generating AI text content for Instagram post")
+            from app.services.groq_service import groq_service
+            
+            ai_text_result = await groq_service.generate_instagram_post(request.content_prompt)
+            if ai_text_result["success"]:
+                final_caption = ai_text_result["content"]
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI text generation failed: {ai_text_result.get('error', 'Unknown error')}"
+                )
+        
+        # Step 2: Generate AI image if requested
+        if request.use_ai_image and request.image_prompt:
+            logger.info("Generating AI image for Instagram post")
+            from app.services.stability_service import stability_service
+            from app.services.cloudinary_service import cloudinary_service
+            
+            image_result = await stability_service.generate_image(request.image_prompt)
+            if image_result["success"]:
+                upload_result = cloudinary_service.upload_image_with_instagram_transform(
+                    f"data:image/png;base64,{image_result['image_base64']}"
+                )
+                if upload_result["success"]:
+                    final_image_url = upload_result["url"]
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Image upload failed: {upload_result.get('error', 'Unknown error')}"
+                    )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Image generation failed: {image_result.get('error', 'Unknown error')}"
+                )
+        
+        # Step 3: Create the Instagram post
+        if request.media_type == "video" and final_video_url:
+            # Handle video post
+            if final_video_url.startswith('data:video/'):
+                # Convert base64 video to URL (you might want to upload to Cloudinary first)
+                # For now, we'll use the base64 data directly
+                logger.info("Creating Instagram video post with base64 data")
+                post_result = await instagram_service.create_post(
+                    instagram_user_id=request.instagram_user_id,
+                    page_access_token=page_access_token,
+                    caption=final_caption,
+                    video_url=final_video_url
+                )
+            else:
+                # Use video URL
+                logger.info("Creating Instagram video post with URL")
+                post_result = await instagram_service.create_post(
+                    instagram_user_id=request.instagram_user_id,
+                    page_access_token=page_access_token,
+                    caption=final_caption,
+                    video_url=final_video_url
+                )
+        else:
+            # Handle image post
+            logger.info(f"Processing image post - final_image_url: {final_image_url}, media_type: {request.media_type}")
+            if final_image_url:
+                logger.info(f"Creating Instagram image post with URL: {final_image_url}")
+                post_result = await instagram_service.create_post(
+                    instagram_user_id=request.instagram_user_id,
+                    page_access_token=page_access_token,
+                    caption=final_caption,
+                    image_url=final_image_url
+                )
+            else:
+                # Text-only post
+                logger.info("Creating Instagram text-only post")
+                post_result = await instagram_service.create_post(
+                    instagram_user_id=request.instagram_user_id,
+                    page_access_token=page_access_token,
+                    caption=final_caption
+                )
+        
+        if not post_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create Instagram post: {post_result.get('error', 'Unknown error')}"
+            )
+        
+        # Save post to database
+        post = Post(
+            user_id=current_user.id,
+            social_account_id=account.id,
+            content=final_caption,
+            post_type=PostType.VIDEO if request.media_type == "video" else PostType.IMAGE,
+            status=PostStatus.PUBLISHED,
+            platform_post_id=post_result.get("post_id"),
+            published_at=datetime.utcnow(),
+            media_urls=[final_image_url] if final_image_url else ([final_video_url] if final_video_url else None)
+        )
+        
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        
+        return SuccessResponse(
+            message="Instagram post created successfully",
+            data={
+                "post_id": post_result.get("post_id"),
+                "database_id": post.id,
+                "platform": "instagram",
+                "account_username": account.username,
+                "caption": final_caption,
+                "media_type": request.media_type,
+                "ai_generated_text": request.use_ai_text,
+                "ai_generated_image": request.use_ai_image
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating unified Instagram post: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create Instagram post: {str(e)}"
         )
 
 
@@ -1299,6 +2260,19 @@ async def create_scheduled_post(
                 )
             social_account_id = facebook_account.id
         
+        # Check if there's already an active schedule for this social account
+        existing_active = db.query(ScheduledPost).filter(
+            ScheduledPost.user_id == current_user.id,
+            ScheduledPost.social_account_id == social_account_id,
+            ScheduledPost.is_active == True
+        ).first()
+        
+        if existing_active:
+            raise HTTPException(
+                status_code=400,
+                detail=f"An active schedule already exists for this account. Please deactivate the existing schedule first."
+            )
+        
         # Calculate next execution time
         from datetime import datetime, timedelta
         
@@ -1410,6 +2384,50 @@ async def delete_scheduled_post(
         )
 
 
+@router.put("/scheduled-posts/{schedule_id}/deactivate")
+async def deactivate_scheduled_post(
+    schedule_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Deactivate a scheduled post (set is_active to False)."""
+    try:
+        # Find the scheduled post
+        scheduled_post = db.query(ScheduledPost).filter(
+            ScheduledPost.id == schedule_id,
+            ScheduledPost.user_id == current_user.id
+        ).first()
+        
+        if not scheduled_post:
+            raise HTTPException(
+                status_code=404,
+                detail="Scheduled post not found"
+            )
+        
+        # Deactivate the scheduled post
+        scheduled_post.is_active = False
+        db.commit()
+        
+        logger.info(f"Deactivated scheduled post {schedule_id} for user {current_user.id}")
+        
+        return SuccessResponse(
+            message="Scheduled post deactivated successfully",
+            data={
+                "id": scheduled_post.id,
+                "is_active": False
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deactivating scheduled post {schedule_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to deactivate scheduled post"
+        )
+
+
 @router.post("/scheduled-posts/trigger")
 async def trigger_scheduler(
     current_user: User = Depends(get_current_user),
@@ -1442,3 +2460,291 @@ async def trigger_scheduler(
             status_code=500,
             detail="Failed to trigger scheduler"
         )
+
+
+@router.get("/debug/stability-ai-status")
+async def debug_stability_ai_status(
+    current_user: User = Depends(get_current_user)
+):
+    """Debug endpoint to check Stability AI service status."""
+    try:
+        from app.services.fb_stability_service import stability_service
+        from app.services.image_service import image_service
+        import os
+        from pathlib import Path
+        
+        result = {
+            "stability_configured": stability_service.is_configured(),
+            "temp_images_dir_exists": Path("temp_images").exists(),
+            "temp_images_writable": os.access("temp_images", os.W_OK) if Path("temp_images").exists() else False,
+            "temp_images_files": []
+        }
+        
+        # List files in temp_images directory
+        if Path("temp_images").exists():
+            try:
+                result["temp_images_files"] = [f.name for f in Path("temp_images").iterdir() if f.is_file()][-10:]  # Last 10 files
+            except Exception as e:
+                result["temp_images_error"] = str(e)
+        
+        # Test a simple image generation if configured
+        if stability_service.is_configured():
+            try:
+                test_result = await stability_service.generate_image(
+                    prompt="A simple test image",
+                    width=512,
+                    height=512,
+                    steps=10  # Quick generation
+                )
+                result["test_generation"] = {
+                    "success": test_result["success"],
+                    "error": test_result.get("error") if not test_result["success"] else None
+                }
+                
+                # If generation worked, try saving the image
+                if test_result["success"]:
+                    save_result = image_service.save_base64_image(
+                        base64_data=test_result["image_base64"],
+                        filename="debug_test_image.png"
+                    )
+                    result["test_save"] = {
+                        "success": save_result["success"],
+                        "error": save_result.get("error") if not save_result["success"] else None,
+                        "file_path": save_result.get("file_path")
+                    }
+                    
+            except Exception as e:
+                result["test_generation"] = {
+                    "success": False,
+                    "error": str(e)
+                }
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Debug stability AI status error: {e}")
+        return {
+            "error": str(e)
+        }
+
+
+@router.get("/debug/instagram-stability-status")
+async def debug_instagram_stability_status(
+    current_user: User = Depends(get_current_user)
+):
+    """Debug endpoint to check Instagram Stability AI configuration."""
+    try:
+        from app.services.stability_service import stability_service
+        import os
+        
+        # Check Instagram Stability service
+        configured = stability_service.is_configured()
+        api_key = stability_service.api_key
+        
+        key_info = "Configured" if api_key else "Not configured"
+        if api_key:
+            key_info += f" (starts with: {api_key[:10]}...)"
+        
+        # Test the API key with a simple request
+        test_result = None
+        if configured:
+            try:
+                test_result = await stability_service.generate_image("test")
+                test_status = "Success" if test_result.get("success") else f"Failed: {test_result.get('error', 'Unknown error')}"
+            except Exception as e:
+                test_status = f"Exception: {str(e)}"
+        else:
+            test_status = "Not configured"
+        
+        return {
+            "instagram_stability_service": {
+                "configured": configured,
+                "api_key_status": key_info,
+                "test_result": test_status
+            },
+            "environment_variable": {
+                "STABILITY_API_KEY_set": bool(os.getenv("STABILITY_API_KEY")),
+                "value_preview": os.getenv("STABILITY_API_KEY", "")[:10] + "..." if os.getenv("STABILITY_API_KEY") else "Not set"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking Instagram Stability AI status: {e}")
+        return {
+            "error": str(e)
+        }
+
+
+@router.post("/debug/test-facebook-image-post")
+async def debug_test_facebook_image_post(
+    page_id: str,
+    test_message: str = "Test post from debug endpoint",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint for testing Facebook image posts."""
+    try:
+        from app.services.facebook_service import facebook_service
+        
+        logger.info(f"Debug: Testing Facebook image post for user {current_user.id}")
+        
+        # Get page account
+        page_account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "facebook",
+            SocialAccount.platform_user_id == page_id,
+            SocialAccount.is_connected == True
+        ).first()
+        
+        if not page_account:
+            return {
+                "success": False,
+                "error": "Page not found or not connected"
+            }
+        
+        # Generate a test image
+        result = await facebook_service.generate_and_post_image(
+            page_id=page_id,
+            access_token=page_account.access_token,
+            image_prompt="a simple test image with bright colors",
+            text_content=test_message,
+            post_type="feed"
+        )
+        
+        return {
+            "success": result["success"],
+            "data": result if result["success"] else {"error": result.get("error")}
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug test error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.get("/debug/imgbb-test")
+async def debug_imgbb_test(
+    current_user: User = Depends(get_current_user)
+):
+    """Debug endpoint to test IMGBB upload functionality."""
+    try:
+        from app.services.image_service import image_service
+        from app.config import get_settings
+        import base64
+        
+        settings = get_settings()
+        
+        # Check if IMGBB is configured
+        if not settings.imgbb_api_key:
+            return {
+                "success": False,
+                "error": "IMGBB_API_KEY not configured",
+                "imgbb_configured": False
+            }
+        
+        # Create a simple test image (1x1 pixel PNG)
+        test_image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAGAWqemowAAAABJRU5ErkJggg=="
+        
+        # Test IMGBB upload
+        result = image_service.save_base64_image(
+            base64_data=test_image_b64,
+            filename="debug_test.png",
+            format="png"
+        )
+        
+        return {
+            "success": result["success"],
+            "imgbb_configured": True,
+            "imgbb_api_key_length": len(settings.imgbb_api_key) if settings.imgbb_api_key else 0,
+            "upload_result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"IMGBB debug test error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "imgbb_configured": bool(get_settings().imgbb_api_key)
+        }
+
+
+@router.post("/debug/simple-facebook-test")
+async def debug_simple_facebook_test(
+    page_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Simple debug endpoint to test Facebook posting directly."""
+    try:
+        from app.services.facebook_service import facebook_service
+        
+        logger.info(f"=== SIMPLE FACEBOOK TEST ===")
+        
+        # Get page account
+        page_account = db.query(SocialAccount).filter(
+            SocialAccount.user_id == current_user.id,
+            SocialAccount.platform == "facebook",
+            SocialAccount.platform_user_id == page_id,
+            SocialAccount.is_connected == True
+        ).first()
+        
+        if not page_account:
+            return {
+                "success": False,
+                "error": "Page not found or not connected"
+            }
+        
+        logger.info(f"Found page: {page_account.display_name}")
+        logger.info(f"Access token: {page_account.access_token[:20]}..." if page_account.access_token else "None")
+        
+        # Test 1: Simple text post
+        logger.info("Test 1: Simple text post")
+        text_result = await facebook_service.create_post(
+            page_id=page_id,
+            access_token=page_account.access_token,
+            message="Test post from debug endpoint - " + datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            media_type="text"
+        )
+        
+        logger.info(f"Text post result: {text_result}")
+        
+        # Test 2: Image post with a simple test image
+        logger.info("Test 2: Image post with test image")
+        
+        # Create a simple test image URL (using a public placeholder)
+        test_image_url = "https://via.placeholder.com/800x600/FF0000/FFFFFF?text=Test+Image"
+        
+        image_result = await facebook_service.create_post(
+            page_id=page_id,
+            access_token=page_account.access_token,
+            message="Test image post from debug endpoint - " + datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            media_url=test_image_url,
+            media_type="photo"
+        )
+        
+        logger.info(f"Image post result: {image_result}")
+        
+        return {
+            "success": True,
+            "tests": {
+                "text_post": text_result,
+                "image_post": image_result
+            },
+            "page_info": {
+                "id": page_account.id,
+                "name": page_account.display_name,
+                "platform_id": page_account.platform_user_id,
+                "has_token": bool(page_account.access_token)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Simple test error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error": str(e)
+        }

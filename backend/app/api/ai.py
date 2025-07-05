@@ -153,19 +153,34 @@ async def get_ai_service_status(current_user: User = Depends(get_current_user)):
     try:
         groq_available = groq_service.is_available()
         
+        # Check Stability AI service
+        try:
+            from app.services.fb_stability_service import stability_service
+            stability_available = stability_service.is_configured()
+        except ImportError:
+            stability_available = False
+        
         return {
             "groq_service": {
                 "available": groq_available,
                 "status": "healthy" if groq_available else "unavailable",
                 "model": "llama-3.1-8b-instant"
             },
+            "stability_ai_service": {
+                "available": stability_available,
+                "status": "healthy" if stability_available else "unavailable",
+                "model": "stable-diffusion-v1-6",
+                "features": ["text-to-image", "facebook-optimized-dimensions"]
+            },
             "supported_platforms": ["facebook", "instagram", "twitter"],
             "supported_content_types": ["post", "comment", "reply", "story"],
             "features": {
                 "content_generation": groq_available,
+                "image_generation": stability_available,
                 "auto_reply": groq_available,
                 "multi_platform": True,
-                "customizable_prompts": True
+                "customizable_prompts": True,
+                "facebook_image_posts": stability_available
             }
         }
         

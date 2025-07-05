@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from app.models.post import PostStatus, PostType
@@ -146,6 +146,7 @@ class AutoReplyToggleRequest(BaseModel):
     enabled: bool
     page_id: str
     response_template: Optional[str] = "Thank you for your comment! We'll get back to you soon."
+    selected_post_ids: Optional[List[int]] = Field(default=[], description="List of post IDs to enable auto-reply for")
 
 
 # Webhook payload schemas

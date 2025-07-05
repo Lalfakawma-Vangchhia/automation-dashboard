@@ -9,6 +9,7 @@ from app.models.social_account import SocialAccount
 from app.models.post import Post, PostStatus, PostType
 from app.services.groq_service import groq_service
 from app.services.facebook_service import facebook_service
+from app.services.auto_reply_service import auto_reply_service
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +21,16 @@ class SchedulerService:
     async def start(self):
         """Start the scheduler service"""
         if self.running:
+            logger.info("Scheduler service already running")
             return
         
         self.running = True
-        logger.info("🚀 Scheduler service started")
+        logger.info("🚀 Scheduler service started - checking every 30 seconds")
         
         while self.running:
             try:
                 await self.process_scheduled_posts()
+                await self.process_auto_replies()
                 await asyncio.sleep(self.check_interval)
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}")
@@ -40,9 +43,10 @@ class SchedulerService:
     
     async def process_scheduled_posts(self):
         """Process all scheduled posts that are due for execution"""
+        db: Session = None
         try:
             # Get database session
-            db: Session = next(get_db())
+            db = next(get_db())
             
             # Find all active scheduled posts that are due for execution
             now = datetime.utcnow()
@@ -53,6 +57,8 @@ class SchedulerService:
             
             if due_posts:
                 logger.info(f"📅 Found {len(due_posts)} scheduled posts due for execution")
+            else:
+                logger.info(f"🔍 No scheduled posts due for execution at {now}")
             
             for scheduled_post in due_posts:
                 try:
@@ -60,10 +66,11 @@ class SchedulerService:
                 except Exception as e:
                     logger.error(f"Failed to execute scheduled post {scheduled_post.id}: {e}")
             
-            db.close()
-            
         except Exception as e:
             logger.error(f"Error processing scheduled posts: {e}")
+        finally:
+            if db:
+                db.close()
     
     async def execute_scheduled_post(self, scheduled_post: ScheduledPost, db: Session):
         """Execute a single scheduled post"""
@@ -75,9 +82,15 @@ class SchedulerService:
                 SocialAccount.id == scheduled_post.social_account_id
             ).first()
             
-            if not social_account or not social_account.is_connected:
-                logger.error(f"Social account {scheduled_post.social_account_id} not found or not connected")
+            if not social_account:
+                logger.error(f"❌ Social account {scheduled_post.social_account_id} not found in database")
                 return
+            
+            if not social_account.is_connected:
+                logger.error(f"❌ Social account {scheduled_post.social_account_id} ({social_account.display_name}) is not connected")
+                return
+            
+            logger.info(f"✅ Found connected social account: {social_account.display_name} (ID: {social_account.id})")
             
             # Generate content using AI
             generated_content = ""
@@ -191,6 +204,22 @@ class SchedulerService:
             next_exec += timedelta(days=1)
         
         return next_exec
+
+    async def process_auto_replies(self):
+        """Process auto-replies for all active automation rules"""
+        db: Session = None
+        try:
+            # Get database session
+            db = next(get_db())
+            
+            # Process auto-replies
+            await auto_reply_service.process_auto_replies(db)
+            
+        except Exception as e:
+            logger.error(f"Error processing auto-replies: {e}")
+        finally:
+            if db:
+                db.close()
 
 # Create global scheduler instance
 scheduler_service = SchedulerService() 

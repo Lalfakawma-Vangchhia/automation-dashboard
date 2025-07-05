@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta
 from app.config import get_settings
 from app.services.groq_service import groq_service
+from app.services.stability_service import stability_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -187,10 +188,28 @@ class InstagramService:
         
         return f"{base_msg}\n\nTroubleshooting steps:\n" + "\n".join(troubleshooting_steps)
     
-    def create_post(self, instagram_user_id: str, page_access_token: str, 
-                   caption: str, image_url: Optional[str] = None) -> Dict:
-        """Create Instagram post"""
+    async def create_post(self, instagram_user_id: str, page_access_token: str, 
+                   caption: str, image_url: Optional[str] = None, video_url: Optional[str] = None) -> Dict:
+        """Create Instagram post with image or video"""
         try:
+            # Debug logging
+            logger.info(f"Instagram create_post called with: user_id={instagram_user_id}, "
+                       f"caption={caption}, image_url={image_url}, video_url={video_url}")
+            
+            # Validate required parameters
+            if not instagram_user_id:
+                return {"success": False, "error": "Instagram user ID is required"}
+            if not page_access_token:
+                return {"success": False, "error": "Page access token is required"}
+            if not caption:
+                return {"success": False, "error": "Caption is required"}
+            if not image_url and not video_url:
+                return {"success": False, "error": "Either image_url or video_url is required"}
+            
+            # Validate caption length (Instagram limit is 2200 characters)
+            if len(caption) > 2200:
+                return {"success": False, "error": f"Caption too long ({len(caption)} chars). Instagram limit is 2200 characters."}
+            
             # Step 1: Create media object
             media_url = f"{self.graph_url}/{instagram_user_id}/media"
             media_params = {
@@ -199,13 +218,44 @@ class InstagramService:
             }
             
             if image_url:
+                # Validate image URL
+                if not image_url.startswith(('http://', 'https://')):
+                    return {"success": False, "error": "Image URL must be a valid HTTP/HTTPS URL"}
                 media_params['image_url'] = image_url
+                logger.info(f"Creating Instagram image post with URL: {image_url}")
+            elif video_url:
+                if video_url.startswith('data:video/'):
+                    # Handle base64 video data
+                    # For now, we'll need to upload to a hosting service first
+                    # This is a placeholder - you might want to use Cloudinary for video uploads
+                    logger.warning("Base64 video upload not yet implemented. Please use a video URL.")
+                    return {"success": False, "error": "Base64 video upload not yet implemented. Please use a video URL."}
+                else:
+                    # Validate video URL
+                    if not video_url.startswith(('http://', 'https://')):
+                        return {"success": False, "error": "Video URL must be a valid HTTP/HTTPS URL"}
+                    media_params['video_url'] = video_url
+                    logger.info(f"Creating Instagram video post with URL: {video_url}")
+            
+            logger.info(f"Instagram media creation params: {media_params}")
             
             media_response = requests.post(media_url, data=media_params)
-            media_response.raise_for_status()
+            
+            # Log the response for debugging
+            logger.info(f"Instagram API response status: {media_response.status_code}")
+            logger.info(f"Instagram API response text: {media_response.text}")
+            
+            if not media_response.ok:
+                error_data = media_response.json() if media_response.content else {}
+                error_msg = error_data.get('error', {}).get('message', f"HTTP {media_response.status_code}")
+                logger.error(f"Instagram media creation failed: {error_msg}")
+                return {"success": False, "error": f"Instagram API error: {error_msg}"}
             
             media_data = media_response.json()
-            creation_id = media_data['id']
+            creation_id = media_data.get('id')
+            
+            if not creation_id:
+                return {"success": False, "error": "No creation ID returned from Instagram API"}
             
             # Step 2: Publish the media
             publish_url = f"{self.graph_url}/{instagram_user_id}/media_publish"
@@ -214,25 +264,30 @@ class InstagramService:
                 'creation_id': creation_id
             }
             
+            logger.info(f"Publishing Instagram media with creation ID: {creation_id}")
             publish_response = requests.post(publish_url, data=publish_params)
-            publish_response.raise_for_status()
+            
+            if not publish_response.ok:
+                error_data = publish_response.json() if publish_response.content else {}
+                error_msg = error_data.get('error', {}).get('message', f"HTTP {publish_response.status_code}")
+                logger.error(f"Instagram media publishing failed: {error_msg}")
+                return {"success": False, "error": f"Instagram publishing error: {error_msg}"}
             
             publish_data = publish_response.json()
             
-            logger.info(f"Successfully created Instagram post: {publish_data['id']}")
+            logger.info(f"Successfully created Instagram post: {publish_data.get('id')}")
             return {
                 'success': True,
-                'post_id': publish_data['id'],
+                'post_id': publish_data.get('id'),
                 'creation_id': creation_id
             }
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to create Instagram post: {e}")
-            if hasattr(e, 'response') and e.response:
-                error_data = e.response.json() if e.response.content else {}
-                error_msg = error_data.get('error', {}).get('message', str(e))
-                raise Exception(f"Post creation failed: {error_msg}")
-            raise Exception(f"Network error: {str(e)}")
+            logger.error(f"Network error creating Instagram post: {e}")
+            return {"success": False, "error": f"Network error: {str(e)}"}
+        except Exception as e:
+            logger.error(f"Unexpected error creating Instagram post: {e}")
+            return {"success": False, "error": f"Unexpected error: {str(e)}"}
     
     def get_user_media(self, instagram_user_id: str, page_access_token: str, limit: int = 25) -> List[Dict]:
         """Get user's Instagram media"""
@@ -307,6 +362,320 @@ class InstagramService:
                 "success": False,
                 "error": str(e)
             }
+
+    async def generate_instagram_image_with_ai(
+        self,
+        prompt: str,
+        post_type: str = "feed"
+    ) -> Dict[str, Any]:
+        """
+        Generate an image optimized for Instagram using Stability AI.
+        
+        Args:
+            prompt: Text description of the image
+            post_type: Type of Instagram post (feed, story, square)
+            
+        Returns:
+            Dict containing generation result
+        """
+        try:
+            # Instagram-optimized dimensions (using Stability AI allowed dimensions)
+            # Allowed SDXL dimensions: 1024x1024, 1152x896, 1216x832, 1344x768, 1536x640, 640x1536, 768x1344, 832x1216, 896x1152
+            dimensions = {
+                "feed": (1024, 1024),    # Square post (Instagram standard)
+                "story": (832, 1216),     # Instagram Story (close to 1080x1920)
+                "square": (1024, 1024),   # Square post (Instagram standard)
+                "portrait": (896, 1152),  # Portrait post (close to 1080x1350)
+                "landscape": (1152, 896)  # Landscape post (close to 1350x1080)
+            }
+            
+            width, height = dimensions.get(post_type, dimensions["feed"])
+            
+            # Validate dimensions are allowed by Stability AI
+            allowed_dimensions = [
+                (1024, 1024), (1152, 896), (1216, 832), (1344, 768), (1536, 640),
+                (640, 1536), (768, 1344), (832, 1216), (896, 1152)
+            ]
+            
+            if (width, height) not in allowed_dimensions:
+                logger.warning(f"Requested dimensions {width}x{height} not in allowed list, using 1024x1024")
+                width, height = 1024, 1024
+            
+            # Enhance prompt for Instagram
+            enhanced_prompt = f"High-quality, Instagram-worthy image: {prompt}, vibrant colors, good lighting, visually appealing, social media optimized"
+            
+            # Add negative prompt for better quality
+            negative_prompt = "blurry, low quality, distorted, text overlay, watermark, ugly, bad anatomy, low resolution"
+            
+            # Generate image using Stability AI
+            image_result = await stability_service.generate_image(
+                prompt=enhanced_prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                cfg_scale=8.0,  # Higher for better prompt adherence
+                steps=40,       # More steps for better quality
+                samples=1
+            )
+            
+            if not image_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Image generation failed: {image_result.get('error', 'Unknown error')}"
+                }
+            
+            return {
+                "success": True,
+                "image_base64": image_result["image_base64"],
+                "prompt": prompt,
+                "enhanced_prompt": enhanced_prompt,
+                "width": width,
+                "height": height,
+                "post_type": post_type
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating Instagram image with AI: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def generate_carousel_images_with_ai(
+        self,
+        prompt: str,
+        count: int = 3,
+        post_type: str = "feed"
+    ) -> Dict[str, Any]:
+        """
+        Generate multiple images for Instagram carousel using Stability AI.
+        
+        Args:
+            prompt: Text description of the images
+            count: Number of images to generate (3-7)
+            post_type: Type of Instagram post (feed, story, square)
+            
+        Returns:
+            Dict containing generation result with multiple image URLs
+        """
+        try:
+            # Validate count
+            if count < 3 or count > 7:
+                return {
+                    "success": False,
+                    "error": "Carousel must have between 3 and 7 images"
+                }
+            
+            # Instagram-optimized dimensions
+            dimensions = {
+                "feed": (1024, 1024),    # Square post (Instagram standard)
+                "story": (832, 1216),     # Instagram Story
+                "square": (1024, 1024),   # Square post
+                "portrait": (896, 1152),  # Portrait post
+                "landscape": (1152, 896)  # Landscape post
+            }
+            
+            width, height = dimensions.get(post_type, dimensions["feed"])
+            
+            # Validate dimensions are allowed by Stability AI
+            allowed_dimensions = [
+                (1024, 1024), (1152, 896), (1216, 832), (1344, 768), (1536, 640),
+                (640, 1536), (768, 1344), (832, 1216), (896, 1152)
+            ]
+            
+            if (width, height) not in allowed_dimensions:
+                logger.warning(f"Requested dimensions {width}x{height} not in allowed list, using 1024x1024")
+                width, height = 1024, 1024
+            
+            # Generate multiple images
+            image_urls = []
+            for i in range(count):
+                # Create variation of prompt for each image
+                variation_prompt = f"{prompt} - variation {i+1}, unique composition, different angle or perspective"
+                enhanced_prompt = f"High-quality, Instagram-worthy image: {variation_prompt}, vibrant colors, good lighting, visually appealing, social media optimized"
+                
+                # Add negative prompt for better quality
+                negative_prompt = "blurry, low quality, distorted, text overlay, watermark, ugly, bad anatomy, low resolution"
+                
+                # Generate image using Stability AI
+                image_result = await stability_service.generate_image(
+                    prompt=enhanced_prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    cfg_scale=8.0,
+                    steps=40,
+                    samples=1
+                )
+                
+                if not image_result["success"]:
+                    return {
+                        "success": False,
+                        "error": f"Image {i+1} generation failed: {image_result.get('error', 'Unknown error')}"
+                    }
+                
+                # Upload to Cloudinary
+                from app.services.cloudinary_service import cloudinary_service
+                upload_result = cloudinary_service.upload_image_with_instagram_transform(
+                    f"data:image/png;base64,{image_result['image_base64']}"
+                )
+                
+                if not upload_result["success"]:
+                    return {
+                        "success": False,
+                        "error": f"Image {i+1} upload failed: {upload_result.get('error', 'Unknown error')}"
+                    }
+                
+                image_urls.append(upload_result["url"])
+            
+            # Generate caption for carousel
+            caption_result = await groq_service.generate_instagram_post(prompt)
+            caption = caption_result.get("content", f"Check out this amazing carousel! {prompt}") if caption_result.get("success") else f"Check out this amazing carousel! {prompt}"
+            
+            return {
+                "success": True,
+                "image_urls": image_urls,
+                "caption": caption,
+                "count": count,
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "post_type": post_type
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating carousel images with AI: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def create_carousel_post(
+        self,
+        instagram_user_id: str,
+        page_access_token: str,
+        caption: str,
+        image_urls: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Create an Instagram carousel post with multiple images.
+        
+        Args:
+            instagram_user_id: Instagram user ID
+            page_access_token: Page access token
+            caption: Post caption
+            image_urls: List of image URLs (3-7 images)
+            
+        Returns:
+            Dict containing post creation result
+        """
+        try:
+            # Validate inputs
+            if not instagram_user_id:
+                return {"success": False, "error": "Instagram user ID is required"}
+            if not page_access_token:
+                return {"success": False, "error": "Page access token is required"}
+            if not caption:
+                return {"success": False, "error": "Caption is required"}
+            if not image_urls or len(image_urls) < 3 or len(image_urls) > 7:
+                return {"success": False, "error": "Carousel must have between 3 and 7 images"}
+            
+            # Validate caption length
+            if len(caption) > 2200:
+                return {"success": False, "error": f"Caption too long ({len(caption)} chars). Instagram limit is 2200 characters."}
+            
+            # Validate image URLs
+            for i, url in enumerate(image_urls):
+                if not url.startswith(('http://', 'https://')):
+                    return {"success": False, "error": f"Image {i+1} URL must be a valid HTTP/HTTPS URL"}
+            
+            logger.info(f"Creating Instagram carousel with {len(image_urls)} images")
+            
+            # Use the working carousel implementation from the reference file
+            # Step 1: Create media object
+            media_url = f"{self.graph_url}/{instagram_user_id}/media"
+            media_params = {
+                'access_token': page_access_token,
+                'caption': caption
+            }
+            
+            # GRAPH API requires creating child containers first for carousel
+            children_creation_ids = []
+            for url in image_urls:
+                child_resp = requests.post(
+                    f"{self.graph_url}/{instagram_user_id}/media",
+                    data={
+                        'access_token': page_access_token,
+                        'image_url': url,
+                        'is_carousel_item': 'true'
+                    }
+                )
+                child_resp.raise_for_status()
+                children_creation_ids.append(child_resp.json()['id'])
+            
+            # Now create carousel container
+            media_params['media_type'] = 'CAROUSEL'
+            # children param is comma-separated list of IDs
+            for idx, cid in enumerate(children_creation_ids):
+                media_params[f'children[{idx}]'] = cid
+            
+            logger.debug("Instagram carousel media_params: %s", media_params)
+            media_response = requests.post(media_url, data=media_params)
+            media_response.raise_for_status()
+            
+            media_data = media_response.json()
+            creation_id = media_data['id']
+            
+            # Step 2: Publish the carousel
+            publish_url = f"{self.graph_url}/{instagram_user_id}/media_publish"
+            publish_params = {
+                'access_token': page_access_token,
+                'creation_id': creation_id
+            }
+            
+            publish_response = requests.post(publish_url, data=publish_params)
+            publish_response.raise_for_status()
+            
+            publish_data = publish_response.json()
+            
+            logger.info(f"Successfully created Instagram carousel: {publish_data['id']}")
+            return {
+                'success': True,
+                'post_id': publish_data['id'],
+                'creation_id': creation_id,
+                'image_count': len(image_urls)
+            }
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create Instagram carousel: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_data = e.response.json() if e.response.content else {}
+                except ValueError:
+                    error_data = {}
+
+                graph_error = error_data.get('error', {}) if isinstance(error_data, dict) else {}
+                error_msg = graph_error.get('message') or graph_error.get('error_user_msg') or str(e)
+                error_type = graph_error.get('type')
+                error_code = graph_error.get('code')
+
+                detailed_msg = f"{error_type} (code {error_code}): {error_msg}" if error_code else error_msg
+
+                return {
+                    'success': False,
+                    'error': f"Carousel creation failed: {detailed_msg}"
+                }
+            # No response at all -> network error
+            return {
+                'success': False,
+                'error': f"Network error: {str(e)}"
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error creating Instagram carousel: {e}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return {"success": False, "error": f"Unexpected error: {str(e)}"}
     
     def is_configured(self) -> bool:
         """Check if Instagram service is properly configured."""

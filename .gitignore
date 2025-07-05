@@ -23,3 +23,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+/frontend/node_modules
+/backend/venv
+        backend/app/services/image_service.py
+        backend/scripts/
+        backend/setup_postgresql.bat
+        backend/temp_images/
+        backend/test_postgresql_connection.py

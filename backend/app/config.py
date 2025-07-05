@@ -5,8 +5,15 @@ import os
 
 
 class Settings(BaseSettings):
-    # Database - default to local SQLite; override in prod via env var
-    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./automation_dashboard.db")
+    # Database - PostgreSQL configuration
+    database_url: str = os.getenv("DATABASE_URL")
+    
+    # PostgreSQL specific settings
+    db_host: str = os.getenv("DB_HOST", "localhost")
+    db_port: int = int(os.getenv("DB_PORT", "5432"))
+    db_name: str = os.getenv("DB_NAME", "auto_dash")
+    db_user: str = os.getenv("DB_USER", "postgres")
+    db_password: str = os.getenv("DB_PASSWORD", "Thor")
 
     # JWT Authentication
     secret_key: str = os.getenv("SECRET_KEY", "change-me")
@@ -23,6 +30,26 @@ class Settings(BaseSettings):
 
     # Groq AI Integration
     groq_api_key: str | None = os.getenv("GROQ_API_KEY")
+
+    # Stability AI Integration
+    stability_api_key: str | None = os.getenv("STABILITY_API_KEY")
+
+    # IMGBB Integration
+    imgbb_api_key: str | None = os.getenv("IMGBB_API_KEY")
+
+    # Cloudinary Integration
+    cloudinary_cloud_name: str | None = os.getenv("CLOUDINARY_CLOUD_NAME")
+    cloudinary_api_key: str | None = os.getenv("CLOUDINARY_API_KEY")
+    cloudinary_api_secret: str | None = os.getenv("CLOUDINARY_API_SECRET")
+    cloudinary_upload_preset: str | None = os.getenv("CLOUDINARY_UPLOAD_PRESET")
+
+    # Google Drive Integration
+    google_drive_client_id: str | None = os.getenv("GOOGLE_DRIVE_CLIENT_ID")
+    google_drive_client_secret: str | None = os.getenv("GOOGLE_DRIVE_CLIENT_SECRET")
+    google_drive_redirect_uri: str | None = os.getenv("GOOGLE_DRIVE_REDIRECT_URI")
+
+    # Backend base URL for OAuth callbacks
+    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
 
     # Environment
     environment: str = os.getenv("ENVIRONMENT", "development")

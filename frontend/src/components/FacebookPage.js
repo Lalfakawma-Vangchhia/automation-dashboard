@@ -1,12 +1,16 @@
+/* eslint-disable no-undef */
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import apiClient from '../services/apiClient';
-import './SocialMediaPage.css';
+import { fileToBase64, MediaIcon, cleanupFacebookSDK, loadFacebookSDK } from './FacebookUtils';
+import './FacebookPage.css';
 
 function FacebookPage() {
   const navigate = useNavigate();
   const { logout } = useAuth();
+  
+  // Core state
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('');
   const [selectedPage, setSelectedPage] = useState(null);
@@ -18,57 +22,231 @@ function FacebookPage() {
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(true);
   
-  // Auto post states
+  // Form states
   const [autoFormData, setAutoFormData] = useState({
     prompt: '',
     mediaType: 'none',
     mediaFile: null,
     generatedContent: '',
-    isGenerating: false
+    isGenerating: false,
+    imagePrompt: '',
+    generatedImageUrl: null,
+    generatedImageFilename: null,
+    isGeneratingImage: false
   });
   
-  // Scheduling states
-  const [isScheduleMode, setIsScheduleMode] = useState(false);
   const [scheduleData, setScheduleData] = useState({
     prompt: '',
     time: '',
-    frequency: 'daily', // daily, weekly, monthly
+    frequency: 'daily',
+    customDate: '',
     isActive: false,
     scheduleId: null
   });
   
-  // Manual post states
   const [manualFormData, setManualFormData] = useState({
     message: '',
     mediaType: 'none',
     mediaFile: null
   });
 
-  // Publishing state
+  // UI states
   const [isPublishing, setIsPublishing] = useState(false);
-  
-  // Posts history
-  const [postHistory, setPostHistory] = useState([]);
+  const [autoPostHistory, setAutoPostHistory] = useState([]);
+  const [manualPostHistory, setManualPostHistory] = useState([]);
+  const [schedulePostHistory, setSchedulePostHistory] = useState([]);
   const [isLoadingPosts, setIsLoadingPosts] = useState(false);
+  const [isTogglingSchedule, setIsTogglingSchedule] = useState(false);
+  
+  // Pagination states
+  const [schedulePage, setSchedulePage] = useState(1);
+  const [scheduleTotalPages, setScheduleTotalPages] = useState(1);
+  const [scheduleTotalCount, setScheduleTotalCount] = useState(0);
 
-  // Facebook App Configuration
+  // File picker modal states
+  const [showFilePicker, setShowFilePicker] = useState(false);
+  const [filePickerType, setFilePickerType] = useState(''); // 'photo' or 'video'
+  const [filePickerFormType, setFilePickerFormType] = useState(''); // 'auto' or 'manual'
+  const [isLoadingGoogleDrive, setIsLoadingGoogleDrive] = useState(false);
+  const [googleDriveAvailable, setGoogleDriveAvailable] = useState(false);
+
+  // Auto-reply states
+  const [autoReplySettings, setAutoReplySettings] = useState({
+    enabled: false,
+    template: 'Thank you for your comment! We appreciate your engagement. 😊',
+    isLoading: false,
+    showSettings: false,
+    selectedPostIds: [],
+    availablePosts: [],
+    isLoadingPosts: false
+  });
+
   const FACEBOOK_APP_ID = process.env.REACT_APP_FACEBOOK_APP_ID || '1526961221410200';
+
+  // Mobile detection utility
+  const isMobile = () => window.innerWidth <= 768;
+  const isSmallMobile = () => window.innerWidth <= 480;
 
   // Check for existing Facebook connections on component mount
   useEffect(() => {
     checkExistingFacebookConnections();
+    checkGoogleDriveAvailability();
+    
+    // Add mobile-specific event listeners
+    const handleResize = () => {
+      // Force re-render on resize for mobile responsiveness
+      setConnectionStatus(prev => prev);
+    };
+    
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Cleanup on component unmount to prevent DOM errors
+  // Cleanup on component unmount
   useEffect(() => {
     return () => {
-      // Clean up any pending operations
       setIsConnecting(false);
       setIsPublishing(false);
       setIsLoggingOut(false);
       setIsCheckingStatus(false);
     };
   }, []);
+
+  const checkGoogleDriveAvailability = async () => {
+    try {
+      const { authenticated } = await apiClient.getGoogleDriveStatus();
+      setGoogleDriveAvailable(authenticated);
+    } catch (error) {
+      console.warn('Drive status check failed:', error.message);
+      setGoogleDriveAvailable(false);
+    }
+  };
+
+  const openDriveAuthPopup = (authUrl) => {
+    return new Promise((resolve, reject) => {
+      // Mobile-friendly popup sizing
+      const isMobile = window.innerWidth <= 768;
+      const w = isMobile ? Math.min(400, window.innerWidth - 40) : 500;
+      const h = isMobile ? Math.min(600, window.innerHeight - 40) : 600;
+      const left = (window.outerWidth - w) / 2;
+      const top = (window.outerHeight - h) / 2;
+
+      const popup = window.open(
+        authUrl,
+        'DriveAuth',
+        `width=${w},height=${h},left=${left},top=${top},scrollbars=yes,resizable=yes`
+      );
+
+      if (!popup) {
+        reject(new Error('Popup blocked'));
+        return;
+      }
+
+      // Listen for messages from the popup
+      const messageHandler = (event) => {
+        if (event.origin !== window.location.origin) return;
+        
+        if (event.data.success) {
+          window.removeEventListener('message', messageHandler);
+          resolve();
+        } else if (event.data.error) {
+          window.removeEventListener('message', messageHandler);
+          reject(new Error(event.data.error));
+        }
+      };
+
+      window.addEventListener('message', messageHandler);
+
+      // Also poll for popup closure as fallback
+      const timer = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(timer);
+          window.removeEventListener('message', messageHandler);
+          resolve(); // Assume success if popup closed without error message
+        }
+      }, 500);
+    });
+  };
+
+  // Load posts when page is selected or tab changes
+  useEffect(() => {
+    if (selectedPage && facebookConnected) {
+      loadPostHistory();
+      loadAutoReplySettings(); // Load auto-reply settings when page is selected
+      loadScheduledPosts(1); // Load scheduled posts and schedule data (reset to page 1)
+    }
+  }, [selectedPage, facebookConnected, activeTab]);
+
+  const loadScheduledPosts = async (page = 1) => {
+    if (!selectedPage) return;
+    
+    try {
+      // Load scheduled posts from backend
+      const scheduledPostsResponse = await apiClient.getScheduledPosts();
+      console.log('📅 Loaded scheduled posts:', scheduledPostsResponse);
+      
+      // Filter scheduled posts for the current page
+      const pageScheduledPosts = scheduledPostsResponse.filter(post => {
+        // Match by social account ID or platform user ID
+        return post.social_account?.platform_user_id === selectedPage.id || 
+               post.social_account?.id === selectedPage.internalId;
+      });
+      
+      console.log('📅 Page scheduled posts:', pageScheduledPosts);
+      
+      // Calculate pagination
+      const postsPerPage = 10;
+      const totalCount = pageScheduledPosts.length;
+      const totalPages = Math.ceil(totalCount / postsPerPage);
+      const startIndex = (page - 1) * postsPerPage;
+      const endIndex = startIndex + postsPerPage;
+      
+      // Update pagination state
+      setScheduleTotalCount(totalCount);
+      setScheduleTotalPages(totalPages);
+      setSchedulePage(page);
+      
+      // Update schedule post history with pagination
+      setSchedulePostHistory(pageScheduledPosts.slice(startIndex, endIndex));
+      
+      // Check if there's an active schedule for this page
+      const activeSchedule = pageScheduledPosts.find(post => post.is_active);
+      
+      if (activeSchedule) {
+        // Update schedule data with the active schedule
+        setScheduleData(prev => ({
+          ...prev,
+          prompt: activeSchedule.prompt,
+          time: activeSchedule.post_time,
+          frequency: activeSchedule.frequency,
+          isActive: true,
+          scheduleId: activeSchedule.id,
+          customDate: activeSchedule.frequency === 'custom' ? activeSchedule.post_time : ''
+        }));
+        console.log('✅ Active schedule found and loaded:', activeSchedule);
+      } else {
+        // Only reset if we don't have a local active state that we're trying to maintain
+        setScheduleData(prev => {
+          // If we're in the middle of a toggle operation, don't override the state
+          if (prev.isActive && prev.scheduleId) {
+            console.log('🔄 Keeping local active state during operation');
+            return prev;
+          }
+          
+          return {
+            ...prev,
+            isActive: false,
+            scheduleId: null
+          };
+        });
+        console.log('❌ No active schedule found for this page');
+      }
+      
+    } catch (error) {
+      console.error('Error loading scheduled posts:', error);
+      // Keep current state on error
+    }
+  };
 
   const checkExistingFacebookConnections = async () => {
     try {
@@ -79,22 +257,42 @@ function FacebookPage() {
         setExistingConnections(response);
         setFacebookConnected(true);
         
-        // Convert backend data to frontend format for compatibility
-        const pagesFromBackend = response.accounts.pages.map(page => ({
-          id: page.platform_id,
-          name: page.name,
-          category: page.category,
-          access_token: '', // Don't expose tokens in frontend
-          profilePicture: page.profile_picture || '',
-          canPost: page.can_post,
-          canComment: page.can_comment,
-          followerCount: page.follower_count
-        }));
+        let socialAccounts = [];
+        let facebookAccounts = [];
+        
+        try {
+          socialAccounts = await apiClient.getSocialAccounts();
+          facebookAccounts = socialAccounts.filter(acc => 
+            acc.platform === 'facebook' && acc.is_connected
+          );
+        } catch (accountsError) {
+          console.warn('Failed to fetch social accounts:', accountsError);
+        }
+        
+        const pagesFromBackend = response.accounts.pages.map(page => {
+          const matchingAccount = facebookAccounts.find(acc => 
+            acc.platform_user_id === page.platform_id
+          );
+          
+          return {
+            id: page.platform_id,
+            internalId: matchingAccount?.id,
+            name: page.name,
+            category: page.category,
+            access_token: '',
+            profilePicture: page.profile_picture || '',
+            canPost: page.can_post,
+            canComment: page.can_comment,
+            followerCount: page.follower_count
+          };
+        });
         
         setAvailablePages(pagesFromBackend);
         
         if (pagesFromBackend.length === 1) {
           setSelectedPage(pagesFromBackend[0]);
+          // Load auto-reply settings for the single page
+          setTimeout(() => loadAutoReplySettings(), 500);
         }
         
         setCardFlipped(true);
@@ -112,22 +310,51 @@ function FacebookPage() {
 
   const handleFacebookLogout = async () => {
     try {
+      // Check for active schedules before disconnecting
+      if (selectedPage && scheduleData.isActive) {
+        const confirmDisconnect = window.confirm(
+          `⚠️ Warning: You have an active schedule for "${selectedPage.name}". Disconnecting will deactivate this schedule. Do you want to continue?`
+        );
+        
+        if (!confirmDisconnect) {
+          return;
+        }
+        
+        // Deactivate the schedule before disconnecting
+        try {
+          await apiClient.deleteScheduledPost(scheduleData.scheduleId);
+          console.log('✅ Schedule deactivated before disconnect');
+        } catch (scheduleError) {
+          console.warn('Failed to deactivate schedule before disconnect:', scheduleError);
+        }
+      }
+      
       setIsLoggingOut(true);
       setConnectionStatus('Disconnecting from Facebook...');
       
-      const response = await apiClient.logoutFacebook();
+      await apiClient.logoutFacebook();
       
-      // Reset all Facebook-related state
       setFacebookConnected(false);
       setExistingConnections(null);
       setAvailablePages([]);
       setSelectedPage(null);
       setCardFlipped(false);
-      setPostHistory([]);
+      setAutoPostHistory([]);
+      setManualPostHistory([]);
+      setSchedulePostHistory([]);
+      
+      // Reset schedule data
+      setScheduleData({
+        prompt: '',
+        time: '',
+        frequency: 'daily',
+        customDate: '',
+        isActive: false,
+        scheduleId: null
+      });
       
       setConnectionStatus('Successfully disconnected from Facebook');
       
-      // Clear the message after a few seconds
       setTimeout(() => {
         setConnectionStatus('Ready to connect your Facebook account');
       }, 3000);
@@ -140,14 +367,19 @@ function FacebookPage() {
     }
   };
 
-  // Load post history
   const loadPostHistory = async () => {
     if (!selectedPage) return;
     
     try {
       setIsLoadingPosts(true);
       const response = await apiClient.getSocialPosts('facebook');
-      setPostHistory(response.slice(0, 10)); // Show last 10 posts
+      const posts = response.slice(0, 10);
+      
+      // Separate posts by type - only auto and manual posts here
+      // Scheduled posts are handled separately in loadScheduledPosts()
+      setAutoPostHistory(posts.filter((_, index) => index % 2 === 0));
+      setManualPostHistory(posts.filter((_, index) => index % 2 === 1));
+      // Note: schedulePostHistory is now managed by loadScheduledPosts()
     } catch (error) {
       console.error('Error loading post history:', error);
     } finally {
@@ -155,35 +387,77 @@ function FacebookPage() {
     }
   };
 
-  // Load posts when page is selected
-  useEffect(() => {
-    if (selectedPage && facebookConnected) {
-      loadPostHistory();
+  const getCurrentPostHistory = () => {
+    switch (activeTab) {
+      case 'auto':
+        return autoPostHistory;
+      case 'manual':
+        return manualPostHistory;
+      case 'schedule':
+        return schedulePostHistory;
+      default:
+        return autoPostHistory;
     }
-  }, [selectedPage, facebookConnected]);
+  };
 
-  // Handle schedule activation/deactivation
   const handleScheduleToggle = async () => {
     if (!selectedPage) {
       setConnectionStatus('Please select a page first');
       return;
     }
 
-    if (!scheduleData.prompt || !scheduleData.time) {
+    if (!scheduleData.prompt || (!scheduleData.time && scheduleData.frequency !== 'custom')) {
       setConnectionStatus('Please fill in prompt and time before activating schedule');
       return;
     }
 
+    if (isTogglingSchedule) {
+      return; // Prevent multiple rapid clicks
+    }
+
+    let internalAccountId = selectedPage.internalId;
+    
+    if (!internalAccountId) {
+      try {
+        const socialAccounts = await apiClient.getSocialAccounts();
+        const facebookAccounts = socialAccounts.filter(acc => 
+          acc.platform === 'facebook' && acc.is_connected
+        );
+        
+        const matchingAccount = facebookAccounts.find(acc => 
+          acc.platform_user_id === selectedPage.id
+        );
+        
+        if (matchingAccount) {
+          internalAccountId = matchingAccount.id;
+          setSelectedPage(prev => ({
+            ...prev,
+            internalId: matchingAccount.id
+          }));
+        } else {
+          setConnectionStatus('Unable to find account information. Please reconnect your Facebook account.');
+          return;
+        }
+      } catch (error) {
+        console.error('Failed to fetch account information:', error);
+        setConnectionStatus('Unable to find account information. Please reconnect your Facebook account.');
+        return;
+      }
+    }
+
     try {
+      setIsTogglingSchedule(true);
+      
       if (!scheduleData.isActive) {
-        // Activating schedule - create scheduled post
         setConnectionStatus('Creating scheduled post...');
+        
+        const postTime = scheduleData.frequency === 'custom' ? scheduleData.customDate : scheduleData.time;
         
         const response = await apiClient.createScheduledPost({
           prompt: scheduleData.prompt,
-          post_time: scheduleData.time,
+          post_time: postTime,
           frequency: scheduleData.frequency,
-          social_account_id: selectedPage.id
+          social_account_id: internalAccountId
         });
 
         setScheduleData(prev => ({ 
@@ -194,62 +468,122 @@ function FacebookPage() {
         
         setConnectionStatus('Schedule activated successfully! Posts will be published automatically.');
         
-        // Load post history to show scheduled posts
+        // Reload scheduled posts to update the UI
         setTimeout(() => {
-          loadPostHistory();
+          loadScheduledPosts(1);
         }, 1000);
         
       } else {
-        // Deactivating schedule - delete scheduled post
         if (scheduleData.scheduleId) {
           setConnectionStatus('Deactivating schedule...');
-          
-          await apiClient.deleteScheduledPost(scheduleData.scheduleId);
-          
+          // Use deactivate endpoint instead of delete
+          await apiClient.deactivateScheduledPost(scheduleData.scheduleId);
           setConnectionStatus('Schedule deactivated successfully');
         }
         
+        // Immediately update local state
         setScheduleData(prev => ({ 
           ...prev, 
           isActive: false,
           scheduleId: null
         }));
+        
+        // Reload scheduled posts to update the UI
+        setTimeout(() => {
+          loadScheduledPosts(1);
+        }, 1000);
       }
       
     } catch (error) {
       console.error('Schedule toggle error:', error);
-      setConnectionStatus('Failed to update schedule: ' + (error.message || 'Unknown error'));
+      
+      // Handle specific error for existing active schedule
+      if (error.message && error.message.includes('active schedule already exists')) {
+        setConnectionStatus('An active schedule already exists. Please deactivate it first.');
+        // Reload to show the existing active schedule
+        setTimeout(() => {
+          loadScheduledPosts(1);
+        }, 1000);
+      } else {
+        setConnectionStatus('Failed to update schedule: ' + (error.message || 'Unknown error'));
+      }
+    } finally {
+      setIsTogglingSchedule(false);
     }
   };
 
-  // Icon Components
-  const MediaIcon = ({ type }) => {
-    switch(type) {
-      case 'photo':
-        return (
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-            <circle cx="8.5" cy="8.5" r="1.5"/>
-            <polyline points="21,15 16,10 5,21"/>
-          </svg>
-        );
-      case 'video':
-        return (
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <polygon points="23 7 16 12 23 17 23 7"/>
-            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
-          </svg>
-        );
-      default:
-        return (
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-          </svg>
-        );
+  const handleAutoReplyToggle = async () => {
+    if (!selectedPage) {
+      setConnectionStatus('Please select a page first');
+      return;
+    }
+
+    // Check if posts are selected when enabling
+    if (!autoReplySettings.enabled && autoReplySettings.selectedPostIds.length === 0) {
+      setConnectionStatus('Please select at least one post to enable auto-reply');
+      return;
+    }
+
+    // Add mobile-friendly confirmation for enabling auto-reply
+    if (!autoReplySettings.enabled) {
+      const isMobile = window.innerWidth <= 768;
+      const confirmMessage = isMobile 
+        ? `Enable auto-reply for ${autoReplySettings.selectedPostIds.length} post(s)?`
+        : `Enable auto-reply for ${autoReplySettings.selectedPostIds.length} post(s)? AI will automatically reply to comments mentioning the commenter.`;
+      
+      if (!window.confirm(confirmMessage)) {
+        return;
+      }
+    }
+
+    try {
+      console.log('🔄 Toggling auto-reply for page:', selectedPage.id, selectedPage.name);
+      console.log('📝 Selected post IDs:', autoReplySettings.selectedPostIds);
+      console.log('🎯 New state will be:', !autoReplySettings.enabled);
+      
+      setAutoReplySettings(prev => ({ ...prev, isLoading: true }));
+      setConnectionStatus(autoReplySettings.enabled ? 'Disabling auto-reply...' : 'Enabling auto-reply...');
+
+      const response = await apiClient.toggleAutoReply(
+        selectedPage.id,
+        !autoReplySettings.enabled,
+        autoReplySettings.template || '', // Use empty string if no template
+        autoReplySettings.selectedPostIds
+      );
+
+      console.log('📡 Backend response:', response);
+
+      if (response.success) {
+        setAutoReplySettings(prev => ({
+          ...prev,
+          enabled: !prev.enabled,
+          isLoading: false,
+          ruleId: response.data?.rule_id || prev.ruleId // Store the rule ID
+        }));
+        
+        console.log('✅ Auto-reply toggled successfully:', {
+          enabled: !autoReplySettings.enabled,
+          ruleId: response.data?.rule_id,
+          selectedPostsCount: response.data?.selected_posts_count
+        });
+        
+        const successMessage = !autoReplySettings.enabled 
+          ? isMobile()
+            ? `Auto-reply enabled for ${response.data?.selected_posts_count || 0} post(s)!`
+            : `Auto-reply enabled successfully for ${response.data?.selected_posts_count || 0} post(s)! AI will automatically reply to comments mentioning the commenter.`
+          : 'Auto-reply disabled successfully.';
+        
+        setConnectionStatus(successMessage);
+      } else {
+        throw new Error(response.error || 'Failed to toggle auto-reply');
+      }
+    } catch (error) {
+      console.error('❌ Auto-reply toggle error:', error);
+      setConnectionStatus('Failed to update auto-reply: ' + (error.message || 'Unknown error'));
+      setAutoReplySettings(prev => ({ ...prev, isLoading: false }));
     }
   };
 
-  // fetchPages function
   const fetchPages = async (accessToken) => {
     if (!accessToken) {
       setConnectionStatus('No Facebook access token found. Please try reconnecting.');
@@ -259,7 +593,6 @@ function FacebookPage() {
     }
     
     try {
-      // Check permissions
       const permissionsResponse = await new Promise((resolve, reject) => {
         window.FB.api('/me/permissions', { access_token: accessToken }, (response) => {
           if (response.error) reject(new Error(response.error.message));
@@ -273,10 +606,8 @@ function FacebookPage() {
       
       if (missingPermissions.length > 0) {
         setConnectionStatus(`Missing permissions: ${missingPermissions.join(', ')}. Your app needs "Pages API" permissions.`);
-        console.error('[fetchPages] Missing required permissions:', missingPermissions);
       }
       
-      // Get user info
       const userInfo = await new Promise((resolve, reject) => {
         window.FB.api('/me', { access_token: accessToken, fields: 'id,name,email' }, (response) => {
           if (response.error) reject(new Error(response.error.message));
@@ -284,7 +615,6 @@ function FacebookPage() {
         });
       });
       
-      // Get user's pages
       const pagesResponse = await new Promise((resolve, reject) => {
         window.FB.api('/me/accounts', {
           access_token: accessToken,
@@ -306,6 +636,7 @@ function FacebookPage() {
         
         return {
           id: page.id,
+          internalId: null,
           name: page.name,
           category: page.category || 'Page',
           access_token: page.access_token,
@@ -318,17 +649,18 @@ function FacebookPage() {
 
       setAvailablePages(mappedPages);
       
-      // Page selection logic
       if (mappedPages.length === 1) {
         setSelectedPage(mappedPages[0]);
         setConnectionStatus(`Connected successfully! 1 page found.`);
+        // Load auto-reply settings for the single page
+        setTimeout(() => loadAutoReplySettings(), 500);
       } else if (mappedPages.length > 1) {
         setSelectedPage(null);
         setConnectionStatus(`Connected successfully! ${mappedPages.length} pages found. Please select a page below.`);
       } else {
-        // Fallback to user profile if no pages available
         setSelectedPage({
           id: userInfo.id,
+          internalId: null,
           name: userInfo.name,
           access_token: accessToken,
           category: 'Personal Profile',
@@ -338,6 +670,8 @@ function FacebookPage() {
           followerCount: 0
         });
         setConnectionStatus('Connected as personal profile (no pages found).');
+        // Load auto-reply settings for personal profile
+        setTimeout(() => loadAutoReplySettings(), 500);
       }
       setFacebookConnected(true);
       setCardFlipped(true);
@@ -352,7 +686,6 @@ function FacebookPage() {
     }
   };
 
-  // Connect to backend
   const connectToBackend = async (accessToken, userInfo, pages) => {
     try {
       const response = await apiClient.connectFacebook(accessToken, userInfo.id, pages);
@@ -366,6 +699,42 @@ function FacebookPage() {
           setConnectionStatus('Connected with long-lived token');
         }
       }
+      
+      setTimeout(async () => {
+        try {
+          const socialAccounts = await apiClient.getSocialAccounts();
+          const facebookAccounts = socialAccounts.filter(acc => 
+            acc.platform === 'facebook' && acc.is_connected
+          );
+          
+          const updatedPages = availablePages.map(page => {
+            const matchingAccount = facebookAccounts.find(acc => 
+              acc.platform_user_id === page.id
+            );
+            return {
+              ...page,
+              internalId: matchingAccount?.id
+            };
+          });
+          
+          setAvailablePages(updatedPages);
+          
+          if (selectedPage) {
+            const matchingAccount = facebookAccounts.find(acc => 
+              acc.platform_user_id === selectedPage.id
+            );
+            if (matchingAccount) {
+              setSelectedPage(prev => ({
+                ...prev,
+                internalId: matchingAccount.id
+              }));
+            }
+          }
+        } catch (error) {
+          console.error('Error updating page data with internal IDs:', error);
+          setConnectionStatus('Warning: Unable to get account details. You may need to reconnect Facebook for scheduling to work.');
+        }
+      }, 2000);
       
       return response;
     } catch (error) {
@@ -404,22 +773,197 @@ function FacebookPage() {
   };
 
   const handleMediaTypeChange = (type, formType) => {
+    // If it's a file upload type, open the file picker
+    if (type === 'photo' || type === 'video') {
+      openFilePicker(type, formType);
+      return;
+    }
+    
+    // For other types (none, ai_image), set directly
     if (formType === 'auto') {
       setAutoFormData(prev => ({
         ...prev,
         mediaType: type,
-        mediaFile: null
+        mediaFile: null,
+        generatedImageUrl: type === 'ai_image' ? prev.generatedImageUrl : null,
+        generatedImageFilename: type === 'ai_image' ? prev.generatedImageFilename : null,
+        imagePrompt: type === 'ai_image' ? prev.imagePrompt : ''
       }));
     } else {
       setManualFormData(prev => ({
         ...prev,
         mediaType: type,
-        mediaFile: null
+        mediaFile: null,
+        generatedImageUrl: type === 'ai_image' ? prev.generatedImageUrl : null,
+        generatedImageFilename: type === 'ai_image' ? prev.generatedImageFilename : null,
+        imagePrompt: type === 'ai_image' ? prev.imagePrompt : ''
       }));
     }
   };
 
-  // Generate content using AI
+  // File picker functions
+  const openFilePicker = (type, formType) => {
+    setFilePickerType(type);
+    setFilePickerFormType(formType);
+    setShowFilePicker(true);
+  };
+
+  const closeFilePicker = () => {
+    setShowFilePicker(false);
+    setFilePickerType('');
+    setFilePickerFormType('');
+    setIsLoadingGoogleDrive(false);
+  };
+
+  const handleLocalFileSelect = (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      const setFormData = filePickerFormType === 'auto' ? setAutoFormData : setManualFormData;
+      setFormData(prev => ({
+        ...prev,
+        mediaFile: file,
+        mediaType: filePickerType // Set the media type based on what was selected
+      }));
+      closeFilePicker();
+    }
+  };
+
+  const handleGoogleDriveSelect = async () => {
+    setIsLoadingGoogleDrive(true);
+    try {
+      // 1️⃣ Check if already authenticated
+      const status = await apiClient.getGoogleDriveStatus();
+      if (!status.authenticated) {
+        // 2️⃣ Get consent URL for popup
+        const authResponse = await apiClient.getGoogleDriveAuthorizeUrl();
+        if (authResponse.consent_url) {
+          // 3️⃣ Open popup and wait for completion
+          await openDriveAuthPopup(authResponse.consent_url);
+        }
+      }
+
+      // 4️⃣ After popup closes, re-check authentication status
+      const finalStatus = await apiClient.getGoogleDriveStatus();
+      if (!finalStatus.authenticated) {
+        throw new Error('Authentication was not completed successfully');
+      }
+
+      // 5️⃣ Update state and proceed with Google Drive picker
+      setGoogleDriveAvailable(true);
+
+      // Initialize Google Drive API
+      await loadGoogleDriveAPI();
+      
+      // Check if google object is available
+      if (typeof window.google === 'undefined' || !window.google.picker) {
+        throw new Error('Google Picker API failed to load');
+      }
+      
+      // Get fresh token for picker
+      const authResult = await apiClient.getGoogleDriveToken();
+      
+      // Open Google Drive picker
+      const picker = new window.google.picker.PickerBuilder()
+        .addView(new window.google.picker.DocsView()
+          .setIncludeFolders(true)
+          .setSelectFolderEnabled(false)
+          .setMimeTypes(filePickerType === 'photo' ? 'image/*' : 'video/*'))
+        .setOAuthToken(authResult.access_token)
+        .setDeveloperKey(process.env.REACT_APP_GOOGLE_DEVELOPER_KEY || '')
+        .setCallback(handleGoogleDriveCallback)
+        .enableFeature(window.google.picker.Feature.NAV_HIDDEN)
+        .enableFeature(window.google.picker.Feature.MULTISELECT_ENABLED, false)
+        .setTitle('Select a file from Google Drive')
+        .setSelectableMimeTypes(filePickerType === 'photo' ? 'image/*' : 'video/*')
+        .build();
+      
+      picker.setVisible(true);
+      
+    } catch (error) {
+      console.error('Error with Google Drive selection:', error);
+      setConnectionStatus(`Google Drive error: ${error.message}`);
+    } finally {
+      setIsLoadingGoogleDrive(false);
+    }
+  };
+
+  const loadGoogleDriveAPI = () => {
+    return new Promise((resolve, reject) => {
+      if (window.google && window.google.picker) {
+        resolve();
+        return;
+      }
+
+      const script = document.createElement('script');
+      script.src = 'https://apis.google.com/js/api.js';
+      script.onload = () => {
+        if (window.gapi) {
+          window.gapi.load('picker', () => {
+            resolve();
+          });
+        } else {
+          reject(new Error('Google API failed to load'));
+        }
+      };
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  };
+
+  const getGoogleDriveToken = async () => {
+    // This would typically come from your backend after user authentication
+    // For now, we'll use a placeholder - you'll need to implement OAuth flow
+    try {
+      const response = await apiClient.getGoogleDriveToken();
+      return response.access_token;
+    } catch (error) {
+      throw new Error('Google Drive authentication required. Please connect your Google account first.');
+    }
+  };
+
+  const handleGoogleDriveCallback = async (data) => {
+    if (data.action === window.google.picker.Action.PICKED) {
+      const file = data.docs[0];
+      try {
+        // Download the file from Google Drive
+        const fileContent = await downloadGoogleDriveFile(file.id);
+        
+        // Create a File object from the downloaded content
+        const blob = new Blob([fileContent], { 
+          type: file.mimeType 
+        });
+        const fileObj = new File([blob], file.name, { 
+          type: file.mimeType 
+        });
+        
+        // Update the form data
+        const setFormData = filePickerFormType === 'auto' ? setAutoFormData : setManualFormData;
+        setFormData(prev => ({
+          ...prev,
+          mediaFile: fileObj,
+          mediaType: filePickerType // Set the media type based on what was selected
+        }));
+        
+        closeFilePicker();
+        setConnectionStatus('File selected from Google Drive successfully!');
+      } catch (error) {
+        console.error('Error downloading file from Google Drive:', error);
+        setConnectionStatus('Failed to download file from Google Drive: ' + error.message);
+      }
+    }
+  };
+
+  const downloadGoogleDriveFile = async (fileId) => {
+    // This would typically be handled by your backend
+    // For now, we'll use a placeholder implementation
+    try {
+      const response = await apiClient.downloadGoogleDriveFile(fileId);
+      return response.fileContent;
+    } catch (error) {
+      throw new Error('Failed to download file from Google Drive');
+    }
+  };
+
   const generatePostContent = async () => {
     if (!autoFormData.prompt.trim()) {
       setConnectionStatus('Please enter a prompt for AI generation');
@@ -444,7 +988,81 @@ function FacebookPage() {
     }
   };
 
-  // Publish post to Facebook
+  const generateImage = async (formType) => {
+    const currentData = formType === 'auto' ? autoFormData : manualFormData;
+    const setFormData = formType === 'auto' ? setAutoFormData : setManualFormData;
+    
+    const imagePrompt = currentData.imagePrompt || currentData.prompt || (formType === 'manual' ? currentData.message : '');
+    
+    if (!imagePrompt.trim()) {
+      setConnectionStatus('Please enter an image prompt or description');
+      return;
+    }
+
+    setFormData(prev => ({ ...prev, isGeneratingImage: true }));
+    setConnectionStatus('Generating image with AI...');
+
+    try {
+      const response = await apiClient.generateFacebookImage(imagePrompt, 'feed');
+      
+      if (response.success) {
+        setFormData(prev => ({
+          ...prev,
+          generatedImageUrl: response.data.image_url,
+          generatedImageFilename: response.data.filename,
+          isGeneratingImage: false
+        }));
+        setConnectionStatus('Image generated successfully!');
+      } else {
+        throw new Error(response.error || 'Image generation failed');
+      }
+    } catch (error) {
+      console.error('Image generation error:', error);
+      setConnectionStatus('Failed to generate image: ' + (error.message || 'Unknown error'));
+      setFormData(prev => ({ ...prev, isGeneratingImage: false }));
+    }
+  };
+
+  const generateImageWithCaption = async () => {
+    if (!autoFormData.prompt.trim()) {
+      setConnectionStatus('Please enter a prompt for generation');
+      return;
+    }
+
+    setAutoFormData(prev => ({ ...prev, isGenerating: true, isGeneratingImage: true }));
+    setConnectionStatus('Generating image and caption with AI...');
+
+    try {
+      const textResponse = await apiClient.generateContent(autoFormData.prompt);
+      
+      if (!textResponse.content) {
+        throw new Error('Failed to generate text content');
+      }
+
+      const imagePrompt = autoFormData.imagePrompt || autoFormData.prompt;
+      const imageResponse = await apiClient.generateFacebookImage(imagePrompt, 'feed');
+      
+      if (!imageResponse.success) {
+        throw new Error(imageResponse.error || 'Image generation failed');
+      }
+
+      setAutoFormData(prev => ({
+        ...prev,
+        generatedContent: textResponse.content,
+        generatedImageUrl: imageResponse.data.image_url,
+        generatedImageFilename: imageResponse.data.filename,
+        isGenerating: false,
+        isGeneratingImage: false
+      }));
+      
+      setConnectionStatus('Image and caption generated successfully!');
+    } catch (error) {
+      console.error('Image with caption generation error:', error);
+      setConnectionStatus('Failed to generate image and caption: ' + (error.message || 'Unknown error'));
+      setAutoFormData(prev => ({ ...prev, isGenerating: false, isGeneratingImage: false }));
+    }
+  };
+
   const publishPost = async () => {
     if (!selectedPage) {
       setConnectionStatus('Please select a page first');
@@ -455,14 +1073,35 @@ function FacebookPage() {
     const content = isAutoMode ? autoFormData.generatedContent : manualFormData.message;
     const mediaType = isAutoMode ? autoFormData.mediaType : manualFormData.mediaType;
     const mediaFile = isAutoMode ? autoFormData.mediaFile : manualFormData.mediaFile;
+    const generatedImageUrl = isAutoMode ? autoFormData.generatedImageUrl : manualFormData.generatedImageUrl;
+    const generatedImageFilename = isAutoMode ? autoFormData.generatedImageFilename : manualFormData.generatedImageFilename;
 
+          // Debug: Log key info
+      console.log('Publish attempt - Tab:', activeTab, 'Content:', content?.substring(0, 50) + '...');
+      console.log('Media type:', mediaType);
+      console.log('Media file:', mediaFile);
+      console.log('Selected page:', selectedPage);
+
+    // Allow video-only posts (no text required for video posts)
     if (!content || content.trim() === '') {
-      setConnectionStatus('Please enter some content for your post');
+      if (mediaType !== 'video') {
+        setConnectionStatus('Please enter some content for your post');
+        return;
+      }
+    }
+
+    if (mediaType === 'photo' && !mediaFile) {
+      setConnectionStatus('Please select a media file to upload');
       return;
     }
 
-    if (mediaType !== 'none' && !mediaFile) {
-      setConnectionStatus('Please select a media file to upload');
+    if (mediaType === 'video' && !mediaFile) {
+      setConnectionStatus('Please select a video file to upload');
+      return;
+    }
+
+    if (mediaType === 'ai_image' && (!generatedImageUrl || !generatedImageFilename)) {
+      setConnectionStatus('Please generate an image first');
       return;
     }
 
@@ -470,56 +1109,111 @@ function FacebookPage() {
       setIsPublishing(true);
       setConnectionStatus('Publishing post to Facebook...');
       
-      // Ensure Facebook SDK is initialized and ready
-      if (!window.FB) {
-        console.log('Facebook SDK not found, initializing...');
-        await loadFacebookSDK();
-      }
+      let postResult;
       
-      // Verify SDK is properly initialized
-      if (!window.FB || !window.FB.api || !window.FB.getLoginStatus) {
-        throw new Error('Facebook SDK not properly initialized');
-      }
-      
-      // Check login status before posting
-      const loginStatus = await new Promise((resolve) => {
-        window.FB.getLoginStatus(resolve, true);
-      });
-      
-      if (loginStatus.status !== 'connected') {
-        throw new Error('Facebook login session expired. Please reconnect your account.');
-      }
-      
-      console.log('Facebook SDK ready for posting');
-      
-      if (mediaType === 'none') {
-        await postTextOnly(content);
+      // Use the unified Facebook post creation endpoint
+      const postOptions = {
+        postType: 'feed'
+      };
+
+      // Handle content based on mode
+      if (isAutoMode) {
+        // In auto mode, we might want to use AI generation
+        if (autoFormData.generatedContent) {
+          // Use pre-generated content
+          postOptions.textContent = autoFormData.generatedContent;
+        } else if (autoFormData.prompt) {
+          // Use prompt for AI generation
+          postOptions.contentPrompt = autoFormData.prompt;
+          postOptions.useAIText = true;
+        } else {
+          // Fallback to any content we have
+          postOptions.textContent = content;
+        }
       } else {
-        await postWithMedia(content, mediaFile, mediaType);
+        // In manual mode, use the provided text content if available
+        if (content && content.trim()) {
+          postOptions.textContent = content;
+        }
+      }
+
+      // Debug: Log what we're sending
+      console.log('Post options:', { ...postOptions, textContent: postOptions.textContent?.substring(0, 50) + '...' });
+
+      if (mediaType === 'ai_image' && generatedImageUrl && generatedImageFilename) {
+        // Post with pre-generated image
+        postOptions.imageUrl = generatedImageUrl;
+        postOptions.imageFilename = generatedImageFilename;
+      } else if (mediaType === 'ai_image' && (autoFormData.imagePrompt || manualFormData.imagePrompt)) {
+        // Generate image using AI
+        const imagePrompt = isAutoMode ? autoFormData.imagePrompt : manualFormData.imagePrompt;
+        postOptions.imagePrompt = imagePrompt;
+        postOptions.useAIImage = true;
+      } else if (mediaType === 'photo' && mediaFile) {
+        // Post with uploaded image (convert to base64)
+        const imageData = await fileToBase64(mediaFile);
+        postOptions.imageUrl = imageData;
+      } else if (mediaType === 'video' && mediaFile) {
+        // Post with uploaded video (convert to base64)
+        try {
+          console.log('Converting video to base64...');
+          const videoData = await fileToBase64(mediaFile);
+          console.log('Video converted successfully, length:', videoData.length);
+          postOptions.videoUrl = videoData;
+          postOptions.videoFilename = mediaFile.name;
+        } catch (error) {
+          console.error('Error converting video to base64:', error);
+          throw new Error('Failed to process video file: ' + error.message);
+        }
+      }
+
+      // Validate that we have at least one required field
+      if (!postOptions.textContent && !postOptions.contentPrompt && !postOptions.imageUrl && !postOptions.imagePrompt && !postOptions.videoUrl) {
+        throw new Error('No content provided. Please add text content, generate content, or add media.');
+      }
+
+      // Debug: Log final options being sent to API
+      console.log('Final post options being sent to API:', postOptions);
+      console.log('Selected page ID:', selectedPage.id);
+      console.log('Post options keys:', Object.keys(postOptions));
+      console.log('Has video URL:', !!postOptions.videoUrl);
+      console.log('Has image URL:', !!postOptions.imageUrl);
+      console.log('Has text content:', !!postOptions.textContent);
+
+      console.log('Calling API with page ID:', selectedPage.id);
+      postResult = await apiClient.createFacebookPost(selectedPage.id, postOptions);
+      console.log('API response:', postResult);
+      
+      if (!postResult.success) {
+        throw new Error(postResult.error || 'Failed to create post via backend');
       }
 
       setConnectionStatus('Post published successfully!');
       
-      // Reload post history
       setTimeout(() => {
         loadPostHistory();
       }, 1000);
       
-      // Clear form data
       if (isAutoMode) {
         setAutoFormData(prev => ({
           ...prev,
           prompt: '',
           generatedContent: '',
           mediaFile: null,
-          mediaType: 'none'
+          mediaType: 'none',
+          imagePrompt: '',
+          generatedImageUrl: null,
+          generatedImageFilename: null
         }));
       } else {
         setManualFormData(prev => ({
           ...prev,
           message: '',
           mediaFile: null,
-          mediaType: 'none'
+          mediaType: 'none',
+          imagePrompt: '',
+          generatedImageUrl: null,
+          generatedImageFilename: null
         }));
       }
 
@@ -531,75 +1225,12 @@ function FacebookPage() {
     }
   };
 
-  // Post text-only content
-  const postTextOnly = async (message) => {
-    return new Promise((resolve, reject) => {
-      window.FB.api(`/${selectedPage.id}/feed`, 'POST', {
-        message: message,
-        access_token: selectedPage.access_token
-      }, (response) => {
-        if (response.error) {
-          reject(new Error(`${response.error.message} (Code: ${response.error.code})`));
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  };
-
-  // Post content with media
-  const postWithMedia = async (message, file, mediaType) => {
-    const fileData = await fileToBase64(file);
-    
-    if (mediaType === 'photo') {
-      return new Promise((resolve, reject) => {
-        window.FB.api(`/${selectedPage.id}/photos`, 'POST', {
-          caption: message,
-          source: fileData,
-          access_token: selectedPage.access_token
-        }, (response) => {
-          if (response.error) {
-            reject(new Error(`${response.error.message} (Code: ${response.error.code})`));
-          } else {
-            resolve(response);
-          }
-        });
-      });
-    } else if (mediaType === 'video') {
-      return new Promise((resolve, reject) => {
-        window.FB.api(`/${selectedPage.id}/videos`, 'POST', {
-          description: message,
-          source: fileData,
-          access_token: selectedPage.access_token
-        }, (response) => {
-          if (response.error) {
-            reject(new Error(`${response.error.message} (Code: ${response.error.code})`));
-          } else {
-            resolve(response);
-          }
-        });
-      });
-    }
-  };
-
-  // Convert file to base64
-  const fileToBase64 = (file) => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = (error) => reject(error);
-    });
-  };
-
   const loginWithFacebook = async () => {
-    // Check HTTPS requirement
     if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
       setConnectionStatus('Facebook login requires HTTPS. Please use https://localhost:3001 or deploy with HTTPS');
       return;
     }
 
-    // Check backend authentication
     try {
       await apiClient.getCurrentUser();
     } catch (error) {
@@ -615,7 +1246,7 @@ function FacebookPage() {
     setConnectionStatus('Loading Facebook SDK...');
 
     try {
-      await loadFacebookSDK();
+      await loadFacebookSDK(FACEBOOK_APP_ID);
 
       if (!window.FB || typeof window.FB.login !== 'function') {
         setConnectionStatus('Facebook SDK failed to load. Please refresh the page and try again.');
@@ -655,6 +1286,7 @@ function FacebookPage() {
                   if (facebookPages.length > 0) {
                     const backendMappedPages = facebookPages.map(page => ({
                       id: page.platform_user_id,
+                      internalId: page.id,
                       name: page.display_name,
                       category: page.platform_data?.category || 'Page',
                       access_token: page.access_token || response.authResponse.accessToken,
@@ -710,103 +1342,6 @@ function FacebookPage() {
     }
   };
 
-  // Clean up Facebook SDK - safer approach
-  const cleanupFacebookSDK = () => {
-    try {
-      // Clear Facebook objects without DOM manipulation
-      if (window.FB) {
-        try {
-          if (window.FB.getLoginStatus) {
-            window.FB.logout();
-          }
-        } catch (e) {
-          // Ignore errors during cleanup
-        }
-        delete window.FB;
-      }
-      
-      if (window.fbAsyncInit) {
-        delete window.fbAsyncInit;
-      }
-    } catch (e) {
-      // Ignore cleanup errors
-    }
-  };
-
-  // Load Facebook SDK with multiple version fallbacks
-  const loadFacebookSDK = () => {
-    return new Promise((resolve, reject) => {
-      cleanupFacebookSDK();
-      
-      // Try multiple API versions in order of preference
-      const versions = ['v21.0', 'v20.0', 'v19.0', 'v18.0'];
-      let currentVersionIndex = 0;
-      
-              const tryInitialization = () => {
-        const version = versions[currentVersionIndex];
-        
-        window.fbAsyncInit = function () {
-          try {
-            window.FB.init({
-              appId: FACEBOOK_APP_ID,
-              cookie: true,
-              xfbml: true,
-              version: version,
-              status: true
-            });
-            
-            console.log(`Facebook SDK initialized successfully with ${version}`);
-            
-            // Test if the SDK is working
-            window.FB.getLoginStatus(function(response) {
-              console.log('Facebook SDK test successful:', response.status);
-              resolve();
-            }, true);
-            
-          } catch (error) {
-            console.error(`Facebook SDK initialization failed with ${version}:`, error);
-            
-            // Try next version
-            currentVersionIndex++;
-            if (currentVersionIndex < versions.length) {
-              console.log(`Trying Facebook SDK version ${versions[currentVersionIndex]}...`);
-              setTimeout(tryInitialization, 500);
-            } else {
-              reject(new Error('All Facebook SDK versions failed to initialize'));
-            }
-          }
-        };
-
-        // Safer script loading - only add if not already present
-        if (!document.getElementById('facebook-jssdk')) {
-          const script = document.createElement('script');
-          script.id = 'facebook-jssdk';
-          script.src = 'https://connect.facebook.net/en_US/sdk.js';
-          script.async = true;
-          script.defer = true;
-          script.crossOrigin = 'anonymous';
-          script.onerror = () => {
-            console.error(`Failed to load Facebook SDK script for ${version}`);
-            
-            // Try next version
-            currentVersionIndex++;
-            if (currentVersionIndex < versions.length) {
-              console.log(`Trying Facebook SDK version ${versions[currentVersionIndex]}...`);
-              setTimeout(tryInitialization, 500);
-            } else {
-              reject(new Error('Failed to load Facebook SDK script'));
-            }
-          };
-          
-          document.body.appendChild(script);
-        }
-      };
-
-      tryInitialization();
-    });
-  };
-
-  // Add refresh tokens function
   const refreshTokens = async () => {
     try {
       setConnectionStatus('Refreshing Facebook tokens...');
@@ -815,7 +1350,6 @@ function FacebookPage() {
       if (response.data.summary.expired > 0) {
         setConnectionStatus(`Token refresh complete. ${response.data.summary.expired} account(s) need reconnection.`);
         setFacebookConnected(false);
-        // Trigger a status check to update the UI
         setTimeout(() => {
           checkExistingFacebookConnections();
         }, 1000);
@@ -837,167 +1371,211 @@ function FacebookPage() {
     }
   };
 
-  // Update handleCreatePost to handle token expiration errors better
-  const handleCreatePost = async (e) => {
-    e.preventDefault();
-    
-    if (!selectedPage) {
-      setConnectionStatus('Please select a page first');
-      return;
+  const getStatusCardClass = () => {
+    if (connectionStatus.includes('Failed') || connectionStatus.includes('error') || connectionStatus.includes('Error')) {
+      return 'status-card error';
+    } else if (connectionStatus.includes('successful') || connectionStatus.includes('Connected') || connectionStatus.includes('completed')) {
+      return 'status-card success';
+    } else {
+      return 'status-card info';
     }
+  };
 
-    setIsPublishing(true);
-    setConnectionStatus('Creating post...');
-
+  const loadAutoReplySettings = async () => {
+    if (!selectedPage) return;
+    
     try {
-      const currentMessage = activeTab === 'auto' ? autoFormData.generatedContent || autoFormData.prompt : manualFormData.message;
-      const currentMediaFile = activeTab === 'auto' ? autoFormData.mediaFile : manualFormData.mediaFile;
+      console.log('🔄 Loading auto-reply settings for page:', selectedPage.id, selectedPage.name);
       
-      const response = await apiClient.createFacebookPost({
-        page_id: selectedPage.id,
-        message: currentMessage,
-        image: currentMediaFile || null,
-        post_type: activeTab === 'auto' ? 'auto-generated' : 'manual'
-      });
-
-      setConnectionStatus(response.data.message);
+      // Get automation rules for Facebook auto-reply
+      const rules = await apiClient.getAutomationRules('facebook', 'auto_reply');
+      console.log('📋 Found automation rules:', rules);
       
-      // Clear the form data
-      if (activeTab === 'auto') {
-        setAutoFormData(prev => ({ ...prev, prompt: '', generatedContent: '', mediaFile: null }));
+      // Get social accounts to match with the selected page
+      const socialAccounts = await apiClient.getSocialAccounts();
+      const facebookAccounts = socialAccounts.filter(acc => 
+        acc.platform === 'facebook' && acc.is_connected
+      );
+      console.log('👥 Facebook accounts:', facebookAccounts);
+      
+      // Find the social account that matches the selected page
+      const matchingAccount = facebookAccounts.find(acc => 
+        acc.platform_user_id === selectedPage.id
+      );
+      console.log('🎯 Matching account:', matchingAccount);
+      
+      if (matchingAccount) {
+        // Find the auto-reply rule for this specific social account
+        const autoReplyRule = rules.find(rule => 
+          rule.social_account_id === matchingAccount.id
+        );
+        console.log('🤖 Auto-reply rule found:', autoReplyRule);
+        
+        if (autoReplyRule) {
+          setAutoReplySettings(prev => ({
+            ...prev,
+            enabled: autoReplyRule.is_active,
+            template: autoReplyRule.actions?.response_template || prev.template,
+            ruleId: autoReplyRule.id,
+            selectedPostIds: autoReplyRule.actions?.selected_post_ids || []
+          }));
+          console.log('✅ Auto-reply settings loaded:', {
+            enabled: autoReplyRule.is_active,
+            template: autoReplyRule.actions?.response_template,
+            ruleId: autoReplyRule.id,
+            selectedPostIds: autoReplyRule.actions?.selected_post_ids
+          });
+        } else {
+          // Reset to default state if no rule found
+          setAutoReplySettings(prev => ({
+            ...prev,
+            enabled: false,
+            template: 'Thank you for your comment! We appreciate your engagement. 😊',
+            ruleId: null,
+            selectedPostIds: []
+          }));
+          console.log('❌ No auto-reply rule found, using defaults');
+        }
       } else {
-        setManualFormData(prev => ({ ...prev, message: '', mediaFile: null }));
+        // No matching account found, reset to default
+        setAutoReplySettings(prev => ({
+          ...prev,
+          enabled: false,
+          template: 'Thank you for your comment! We appreciate your engagement. 😊',
+          ruleId: null,
+          selectedPostIds: []
+        }));
+        console.log('❌ No matching account found, using defaults');
       }
-      
-      // Refresh posts
-      setTimeout(() => {
-        loadPostHistory();
-      }, 1000);
-      
     } catch (error) {
-      console.error('Post creation error:', error);
+      console.error('❌ Error loading auto-reply settings:', error);
+      // Keep current state on error
+    }
+  };
+
+  const loadPostsForAutoReply = async () => {
+    if (!selectedPage) return;
+    
+    try {
+      setAutoReplySettings(prev => ({ ...prev, isLoadingPosts: true }));
+      console.log('🔄 Loading posts for auto-reply selection for page:', selectedPage.id);
       
-      if (error.response?.status === 401 || error.response?.data?.detail?.includes('expired')) {
-        setConnectionStatus('Facebook session expired. Please reconnect your account.');
-        setFacebookConnected(false);
-        // Automatically trigger token refresh
-        setTimeout(() => {
-          refreshTokens();
-        }, 2000);
+      const response = await apiClient.getPostsForAutoReply(selectedPage.id);
+      console.log('📋 Posts for auto-reply:', response);
+      
+      if (response.success) {
+        setAutoReplySettings(prev => ({
+          ...prev,
+          availablePosts: response.posts,
+          isLoadingPosts: false
+        }));
+        console.log('✅ Posts loaded for auto-reply selection:', response.posts.length);
+        
+        // Show user-friendly message if no posts found
+        if (response.posts.length === 0) {
+          setConnectionStatus('No posts found for auto-reply. Create some posts first using the AI Generate or Manual Post tabs.');
+        }
       } else {
-        setConnectionStatus('Failed to create post: ' + (error.response?.data?.detail || error.message));
+        throw new Error(response.error || 'Failed to load posts');
       }
-    } finally {
-      setIsPublishing(false);
+    } catch (error) {
+      console.error('❌ Error loading posts for auto-reply:', error);
+      
+      // Provide more specific error messages
+      let errorMessage = 'Failed to load posts for auto-reply selection';
+      if (error.message.includes('404')) {
+        errorMessage = 'Facebook page not found. Please reconnect your Facebook account.';
+      } else if (error.message.includes('401')) {
+        errorMessage = 'Authentication failed. Please log in again.';
+      } else if (error.message.includes('500')) {
+        errorMessage = 'Server error. Please try again later.';
+      }
+      
+      setConnectionStatus(errorMessage);
+      setAutoReplySettings(prev => ({ ...prev, isLoadingPosts: false }));
+    }
+  };
+
+  const handlePostSelection = (postId) => {
+    setAutoReplySettings(prev => {
+      const isSelected = prev.selectedPostIds.includes(postId);
+      const newSelectedIds = isSelected 
+        ? prev.selectedPostIds.filter(id => id !== postId)
+        : [...prev.selectedPostIds, postId];
+      
+      return {
+        ...prev,
+        selectedPostIds: newSelectedIds
+      };
+    });
+  };
+
+  // Mobile-friendly touch handler for post selection
+  const handlePostTouch = (postId, event) => {
+    // Prevent double-tap zoom on mobile
+    event.preventDefault();
+    handlePostSelection(postId);
+  };
+
+  const selectAllPosts = () => {
+    setAutoReplySettings(prev => ({
+      ...prev,
+      selectedPostIds: prev.availablePosts.map(post => post.id)
+    }));
+  };
+
+  const deselectAllPosts = () => {
+    setAutoReplySettings(prev => ({
+      ...prev,
+      selectedPostIds: []
+    }));
+  };
+
+  const handleSettingsToggle = () => {
+    const newShowSettings = !autoReplySettings.showSettings;
+    setAutoReplySettings(prev => ({ ...prev, showSettings: newShowSettings }));
+    
+    // Load posts when opening settings
+    if (newShowSettings && autoReplySettings.availablePosts.length === 0) {
+      loadPostsForAutoReply();
     }
   };
 
   return (
-    <div style={{ 
-      minHeight: '100vh',
-      background: '#ffffff',
-      padding: '0',
-      display: 'flex',
-      flexDirection: 'column'
-    }}>
+    <div className="facebook-page-container">
       {/* Navigation Header */}
-      <div className="glass-effect" style={{
-        padding: '1.5rem 2rem',
-        margin: '1.5rem',
-        borderRadius: '25px',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        background: 'rgba(24, 119, 242, 0.05)',
-        backdropFilter: 'blur(25px)',
-        WebkitBackdropFilter: 'blur(25px)',
-        border: '1px solid rgba(24, 119, 242, 0.1)',
-        boxShadow: '0 15px 35px rgba(24, 119, 242, 0.08)',
-        position: 'sticky',
-        top: '1.5rem',
-        zIndex: 100
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <div style={{
-            padding: '0.75rem',
-            borderRadius: '15px',
-            background: facebookConnected ? 'rgba(34, 197, 94, 0.2)' : 'rgba(24, 119, 242, 0.2)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            transition: 'all 0.3s ease',
-            position: 'relative'
-          }}>
-            <svg width="24" height="24" viewBox="0 0 24 24" fill={facebookConnected ? "#22c55e" : "#1877f2"}>
+      <div className="facebook-header">
+        <div className="facebook-header-left">
+          <div className={`facebook-icon-container ${facebookConnected ? 'connected' : ''}`}>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="#1877f2">
               <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
             </svg>
-            {facebookConnected && (
-              <div style={{
-                position: 'absolute',
-                top: '6px',
-                right: '6px',
-                width: '10px',
-                height: '10px',
-                borderRadius: '50%',
-                background: '#22c55e',
-                boxShadow: '0 0 0 2px white'
-              }} />
-            )}
           </div>
           <div>
-            <h1 style={{ 
-              margin: 0, 
-              fontSize: '1.5rem', 
-              fontWeight: '700', 
-              color: '#1a202c',
-              textShadow: '0 1px 2px rgba(0, 0, 0, 0.05)'
-            }}>
+            <h1 className="facebook-title">
               {facebookConnected ? 
                 (selectedPage ? `${selectedPage.name}` : 'Facebook Manager') : 
                 'Facebook Manager'
               }
             </h1>
-            <div style={{ 
-              margin: 0, 
-              fontSize: '0.875rem', 
-              color: '#4a5568',
-              textShadow: 'none',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem'
-            }}>
+            <div className="facebook-subtitle">
               {facebookConnected ? (
                 selectedPage ? (
                   <>
-                    <div style={{
-                      width: '8px',
-                      height: '8px',
-                      borderRadius: '50%',
-                      background: '#22c55e'
-                    }} />
+                    <div className="status-indicator connected" />
                     <span>
-                      {selectedPage.category} • {selectedPage.follower_count || 0} followers
+                      {selectedPage.category} • {selectedPage.followerCount || 0} followers
                     </span>
                   </>
                 ) : (
                   <>
-                    <div style={{
-                      width: '8px',
-                      height: '8px',
-                      borderRadius: '50%',
-                      background: '#f59e0b'
-                    }} />
+                    <div className="status-indicator connecting" />
                     <span>Connected • Select a page to continue</span>
                   </>
                 )
               ) : (
                 <>
-                  <div style={{
-                    width: '8px',
-                    height: '8px',
-                    borderRadius: '50%',
-                    background: '#6b7280'
-                  }} />
+                  <div className="status-indicator disconnected" />
                   <span>Not connected • Ready to link your account</span>
                 </>
               )}
@@ -1005,149 +1583,12 @@ function FacebookPage() {
           </div>
         </div>
         
-        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-          {/* Dynamic Status Indicator */}
-          {facebookConnected && selectedPage && (
-            <div style={{
-              padding: '0.5rem 1rem',
-              background: 'rgba(34, 197, 94, 0.1)',
-              border: '1px solid rgba(34, 197, 94, 0.2)',
-              borderRadius: '25px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              fontSize: '0.75rem',
-              fontWeight: '600',
-              color: '#065f46'
-            }}>
-              <div style={{
-                width: '6px',
-                height: '6px',
-                borderRadius: '50%',
-                background: '#22c55e',
-                animation: 'pulse 2s infinite'
-              }} />
-              Live
-            </div>
-          )}
-          
-          {/* Quick Actions */}
-          {facebookConnected && selectedPage && (
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button
-                onClick={() => window.open(`https://facebook.com/${selectedPage.id}`, '_blank')}
-                style={{
-                  padding: '0.5rem',
-                  background: 'rgba(24, 119, 242, 0.1)',
-                  border: '1px solid rgba(24, 119, 242, 0.2)',
-                  borderRadius: '10px',
-                  color: '#1877f2',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  transition: 'all 0.3s ease'
-                }}
-                title="View Page"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                  <polyline points="15,3 21,3 21,9"/>
-                  <line x1="10" y1="14" x2="21" y2="3"/>
-                </svg>
-              </button>
-              
-              <button
-                onClick={loadPostHistory}
-                disabled={isLoadingPosts}
-                style={{
-                  padding: '0.5rem',
-                  background: 'rgba(59, 130, 246, 0.1)',
-                  border: '1px solid rgba(59, 130, 246, 0.2)',
-                  borderRadius: '10px',
-                  color: '#3b82f6',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  transition: 'all 0.3s ease',
-                  opacity: isLoadingPosts ? 0.7 : 1
-                }}
-                title="Refresh Posts"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ transform: isLoadingPosts ? 'rotate(360deg)' : 'none', transition: 'transform 1s ease' }}>
-                  <path d="M23 4v6h-6"/>
-                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                </svg>
-              </button>
-            </div>
-          )}
-          
-          {/* Facebook Connection Actions - Only show when connected */}
+        <div className="facebook-header-right">
           {facebookConnected && (
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button 
-                onClick={refreshTokens}
-                style={{
-                  padding: '0.875rem 1.5rem',
-                  background: 'rgba(59, 130, 246, 0.1)',
-                  border: '1px solid rgba(59, 130, 246, 0.2)',
-                  borderRadius: '15px',
-                  color: '#3b82f6',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem',
-                  fontWeight: '600',
-                  fontSize: '0.875rem',
-                  transition: 'all 0.3s ease',
-                  backdropFilter: 'blur(10px)',
-                  WebkitBackdropFilter: 'blur(10px)',
-                  textShadow: 'none'
-                }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M23 4v6h-6"/>
-                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                </svg>
-                Refresh Tokens
-              </button>
-              
-              <button 
-                onClick={handleFacebookLogout}
-                disabled={isLoggingOut}
-                style={{
-                  padding: '0.875rem 1.5rem',
-                  background: isLoggingOut ? 
-                    'rgba(239, 68, 68, 0.6)' : 
-                    'rgba(239, 68, 68, 0.1)',
-                  border: '1px solid rgba(239, 68, 68, 0.2)',
-                  borderRadius: '15px',
-                  color: isLoggingOut ? 'white' : '#dc2626',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem',
-                  fontWeight: '600',
-                  fontSize: '0.875rem',
-                  transition: 'all 0.3s ease',
-                  backdropFilter: 'blur(10px)',
-                  WebkitBackdropFilter: 'blur(10px)',
-                  textShadow: 'none',
-                  opacity: isLoggingOut ? 0.7 : 1
-              }}
-              onMouseEnter={(e) => {
-                if (!isLoggingOut) {
-                  e.target.style.background = 'rgba(239, 68, 68, 0.15)';
-                  e.target.style.transform = 'translateY(-2px)';
-                  e.target.style.boxShadow = '0 8px 25px rgba(239, 68, 68, 0.15)';
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!isLoggingOut) {
-                  e.target.style.background = 'rgba(239, 68, 68, 0.1)';
-                  e.target.style.transform = 'translateY(0)';
-                  e.target.style.boxShadow = 'none';
-                }
-              }}
+            <button 
+              onClick={handleFacebookLogout}
+              disabled={isLoggingOut}
+              className="btn btn-danger"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
@@ -1156,38 +1597,11 @@ function FacebookPage() {
               </svg>
               {isLoggingOut ? 'Disconnecting...' : 'Disconnect'}
             </button>
-            </div>
           )}
           
           <button
             onClick={() => navigate('/')}
-            style={{
-              padding: '0.875rem 1.5rem',
-              background: 'rgba(24, 119, 242, 0.1)',
-              border: '1px solid rgba(24, 119, 242, 0.2)',
-              borderRadius: '15px',
-              color: '#1a202c',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              fontWeight: '600',
-              fontSize: '0.875rem',
-              transition: 'all 0.3s ease',
-              backdropFilter: 'blur(10px)',
-              WebkitBackdropFilter: 'blur(10px)',
-              textShadow: 'none'
-            }}
-            onMouseEnter={(e) => {
-              e.target.style.background = 'rgba(24, 119, 242, 0.15)';
-              e.target.style.transform = 'translateY(-2px)';
-              e.target.style.boxShadow = '0 8px 25px rgba(24, 119, 242, 0.15)';
-            }}
-            onMouseLeave={(e) => {
-              e.target.style.background = 'rgba(24, 119, 242, 0.1)';
-              e.target.style.transform = 'translateY(0)';
-              e.target.style.boxShadow = 'none';
-            }}
+            className="btn btn-primary"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="m12 19-7-7 7-7"/>
@@ -1199,183 +1613,33 @@ function FacebookPage() {
       </div>
 
       {/* Main Content Container */}
-      <div style={{
-        flex: 1,
-        padding: '0 1.5rem 2rem 1.5rem',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: facebookConnected ? 'flex-start' : 'center'
-      }}>
-      <style jsx>{`
-        @keyframes float {
-          0%, 100% { transform: translateY(0px); }
-          50% { transform: translateY(-5px); }
-        }
-        
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.7; }
-        }
-        
-        .flip-card {
-          animation: ${cardFlipped ? 'none' : 'float 4s ease-in-out infinite'};
-        }
-        
-        .glass-effect {
-          background: rgba(255, 255, 255, 0.8);
-          backdrop-filter: blur(10px);
-          -webkit-backdrop-filter: blur(10px);
-          border: 1px solid rgba(226, 232, 240, 0.8);
-        }
-        
-        .page-card:hover {
-          transform: translateY(-4px);
-          box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
-        }
-        
-        input:focus, textarea:focus {
-          outline: none;
-          border: 2px solid rgba(59, 130, 246, 0.6);
-        }
-      `}</style>
-
+      <div className={`facebook-main-content ${!facebookConnected ? 'centered' : ''}`}>
         {/* Status Card */}
         {connectionStatus && (
-          <div style={{ 
-            padding: '1rem 1.5rem',
-            borderRadius: '12px',
-            marginBottom: '2rem',
-            color: '#1a202c',
-            fontWeight: '500',
-            textAlign: 'center',
-            maxWidth: '600px',
-            background: connectionStatus.includes('Failed') || connectionStatus.includes('error') || connectionStatus.includes('Error') ? 
-              'rgba(239, 68, 68, 0.1)' : 
-              connectionStatus.includes('successful') || connectionStatus.includes('Connected') || connectionStatus.includes('completed') ? 
-                'rgba(34, 197, 94, 0.1)' : 
-                'rgba(59, 130, 246, 0.1)',
-            border: connectionStatus.includes('Failed') || connectionStatus.includes('error') || connectionStatus.includes('Error') ? 
-              '1px solid rgba(239, 68, 68, 0.3)' : 
-              connectionStatus.includes('successful') || connectionStatus.includes('Connected') || connectionStatus.includes('completed') ? 
-                '1px solid rgba(34, 197, 94, 0.3)' : 
-                '1px solid rgba(59, 130, 246, 0.3)',
-            fontSize: '0.95rem'
-          }}>
+          <div className={getStatusCardClass()}>
             {connectionStatus}
           </div>
         )}
 
         {/* Main Card */}
-        <div 
-          className="flip-card glass-effect"
-          style={{ 
-            width: facebookConnected ? 'auto' : '400px',
-            height: facebookConnected ? 'auto' : '280px',
-            maxWidth: facebookConnected ? '1000px' : '400px',
-            borderRadius: '30px',
-            padding: facebookConnected ? '3rem' : '2.5rem',
-            transition: 'all 0.8s cubic-bezier(0.4, 0, 0.2, 1)',
-            transformStyle: 'preserve-3d',
-            background: 'rgba(255, 255, 255, 0.8)',
-            backdropFilter: 'blur(25px)',
-            WebkitBackdropFilter: 'blur(25px)',
-            border: '1px solid rgba(226, 232, 240, 0.8)',
-            boxShadow: '0 25px 50px rgba(0, 0, 0, 0.08)',
-            position: 'relative',
-            overflow: 'hidden'
-          }}
-        >
-          {/* Decorative Elements */}
-          <div style={{
-            position: 'absolute',
-            top: '-50%',
-            right: '-50%',
-            width: '100%',
-            height: '100%',
-            background: 'radial-gradient(circle, rgba(255, 255, 255, 0.1) 0%, transparent 70%)',
-            pointerEvents: 'none'
-          }} />
-          <div style={{
-            position: 'absolute',
-            bottom: '-30%',
-            left: '-30%',
-            width: '60%',
-            height: '60%',
-            background: 'radial-gradient(circle, rgba(123, 97, 255, 0.1) 0%, transparent 70%)',
-            pointerEvents: 'none'
-          }} />
-                  {!facebookConnected ? (
+        <div className={`facebook-main-card ${!facebookConnected ? 'connect-mode' : ''}`}>
+          {!facebookConnected ? (
             /* Connect Card */
-            <div style={{ 
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              height: '100%',
-              textAlign: 'center',
-              position: 'relative',
-              zIndex: 1
-            }}>
-              <div style={{ 
-                marginBottom: '1rem',
-                padding: '1.5rem',
-                borderRadius: '25px',
-                background: 'rgba(24, 119, 242, 0.15)',
-                backdropFilter: 'blur(10px)',
-                WebkitBackdropFilter: 'blur(10px)',
-                border: '1px solid rgba(24, 119, 242, 0.3)',
-                animation: 'float 3s ease-in-out infinite'
-              }}>
+            <div className="connect-card">
+              <div className="connect-icon">
                 <svg width="64" height="64" viewBox="0 0 24 24" fill="#1877f2">
                   <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
                 </svg>
               </div>
               
-              <h3 style={{
-                fontSize: '1.75rem',
-                fontWeight: '700',
-                color: '#1a202c',
-                textShadow: 'none',
-                marginBottom: '0.75rem',
-                margin: '0 0 0.75rem 0'
-              }}>
+              <h3 className="connect-title">
                 Connect Your Facebook
               </h3>
-              
-
               
               <button 
                 onClick={loginWithFacebook} 
                 disabled={isConnecting || isCheckingStatus}
-                style={{ 
-                  padding: '1rem 2rem',
-                  fontSize: '1rem',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '12px',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem',
-                  fontWeight: '600',
-                  transition: 'all 0.3s ease',
-                  background: '#1877f2',
-                  boxShadow: '0 4px 12px rgba(24, 119, 242, 0.3)',
-                  opacity: (isConnecting || isCheckingStatus) ? 0.7 : 1
-                }}
-                onMouseEnter={(e) => {
-                  if (!isConnecting && !isCheckingStatus) {
-                    e.target.style.transform = 'translateY(-2px)';
-                    e.target.style.boxShadow = '0 6px 20px rgba(24, 119, 242, 0.4)';
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (!isConnecting && !isCheckingStatus) {
-                    e.target.style.transform = 'translateY(0)';
-                    e.target.style.boxShadow = '0 4px 12px rgba(24, 119, 242, 0.3)';
-                  }
-                }}
+                className="connect-button"
               >
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="white">
                   <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
@@ -1383,1011 +1647,823 @@ function FacebookPage() {
                 {isCheckingStatus ? 'Checking Connection...' : (isConnecting ? 'Connecting...' : 'Connect Facebook')}
               </button>
             </div>
-        ) : (
-          /* Connected Content */
-          <div style={{ width: '100%' }}>
-            {/* Pages Section Header */}
-            {availablePages.length > 0 && (
-              <div style={{ 
-                textAlign: 'center',
-                marginBottom: '2rem',
-                position: 'relative',
-                zIndex: 1
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                  <div style={{ flex: 1 }}>
-                    <h2 style={{
-                      fontSize: '1.75rem',
-                      fontWeight: '700',
-                      color: '#1a202c',
-                      textShadow: 'none',
-                      marginBottom: '0.5rem',
-                      margin: '0 0 0.5rem 0'
-                    }}>
-                      Your Facebook Pages
-                    </h2>
-                    <p style={{
-                      fontSize: '1rem',
-                      color: '#4a5568',
-                      textShadow: 'none',
-                      margin: '0'
-                    }}>
-                      Select a page to start creating and managing posts
-                    </p>
-                    {existingConnections && (
-                      <div style={{
-                        marginTop: '0.5rem',
-                        padding: '0.5rem 1rem',
-                        background: 'rgba(34, 197, 94, 0.1)',
-                        border: '1px solid rgba(34, 197, 94, 0.2)',
-                        borderRadius: '8px',
-                        fontSize: '0.875rem',
-                        color: '#065f46',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '0.5rem'
-                      }}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-                          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-                        </svg>
-                        Connected since {new Date(existingConnections.accounts.pages[0]?.connected_at || existingConnections.accounts.personal[0]?.connected_at).toLocaleDateString()}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Pages Grid */}
-            {availablePages.length > 0 && (
-              <div style={{ 
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
-                gap: '1.5rem',
-                marginBottom: '3rem',
-                position: 'relative',
-                zIndex: 1
-              }}>
-                {availablePages.map(page => (
-                  <div
-                    key={page.id}
-                    onClick={() => {
-                      setSelectedPage(page);
-                      setConnectionStatus(`✅ Connected to ${page.name}`);
-                    }}
-                    className="page-card glass-effect"
-                    style={{
-                      padding: '2rem',
-                      borderRadius: '25px',
-                      cursor: 'pointer',
-                      transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                      border: selectedPage?.id === page.id ? 
-                        '2px solid rgba(59, 130, 246, 0.8)' : 
-                        '1px solid rgba(226, 232, 240, 0.8)',
-                      background: selectedPage?.id === page.id ? 
-                        'rgba(59, 130, 246, 0.08)' : 
-                        'rgba(248, 250, 252, 0.8)',
-                      backdropFilter: 'blur(20px)',
-                      WebkitBackdropFilter: 'blur(20px)',
-                      boxShadow: selectedPage?.id === page.id ?
-                        '0 20px 40px rgba(59, 130, 246, 0.15)' :
-                        '0 15px 30px rgba(0, 0, 0, 0.05)',
-                      position: 'relative',
-                      overflow: 'hidden'
-
-                    }}
-                  >
-                    {/* Selection Indicator */}
-                    {selectedPage?.id === page.id && (
-                      <div style={{
-                        position: 'absolute',
-                        top: '1rem',
-                        right: '1rem',
-                        width: '24px',
-                        height: '24px',
-                        borderRadius: '50%',
-                        background: 'rgba(59, 130, 246, 0.9)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        boxShadow: '0 4px 15px rgba(59, 130, 246, 0.4)'
-                      }}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="white" stroke="none">
-                          <polyline points="20,6 9,17 4,12"/>
-                        </svg>
-                      </div>
-                    )}
-
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', marginBottom: '1rem' }}>
-                      {page.profilePicture ? (
-                        <img 
-                          src={page.profilePicture} 
-                          alt=""
-                          style={{
-                            width: '4rem',
-                            height: '4rem',
-                            borderRadius: '50%',
-                            objectFit: 'cover',
-                            border: '3px solid rgba(255, 255, 255, 0.6)',
-                            boxShadow: '0 8px 20px rgba(0, 0, 0, 0.15)'
-                          }}
-                        />
-                      ) : (
-                        <div style={{
-                          width: '4rem',
-                          height: '4rem',
-                          borderRadius: '50%',
-                          background: 'rgba(24, 119, 242, 0.3)',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          border: '3px solid rgba(255, 255, 255, 0.6)',
-                          boxShadow: '0 8px 20px rgba(0, 0, 0, 0.15)'
-                        }}>
-                          <svg width="28" height="28" viewBox="0 0 24 24" fill="#1877f2">
-                            <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
-                          </svg>
-                        </div>
-                      )}
-                      <div style={{ flex: 1 }}>
-                        <h3 style={{ 
-                          margin: 0, 
-                          fontSize: '1.25rem', 
-                          color: '#1a202c', 
-                          fontWeight: '700',
-                          textShadow: 'none',
-                          marginBottom: '0.25rem'
-                        }}>
-                          {page.name}
-                        </h3>
-                        <div style={{ 
-                          display: 'flex', 
-                          alignItems: 'center', 
-                          gap: '0.5rem',
-                          marginBottom: '0.5rem'
-                        }}>
-                          <span style={{ 
-                            fontSize: '0.875rem', 
-                            color: '#4a5568',
-                            textShadow: 'none'
-                          }}>
-                            {page.followerCount.toLocaleString()} followers
-                          </span>
-                          {page.canPost && (
-                            <div style={{
-                              padding: '0.25rem 0.5rem',
-                              background: 'rgba(34, 197, 94, 0.15)',
-                              borderRadius: '8px',
-                              fontSize: '0.75rem',
-                              color: '#065f46',
-                              fontWeight: '600',
-                              textShadow: 'none'
-                            }}>
-                              Can Post
-                            </div>
+          ) : (
+            /* Connected Content */
+            <div className="facebook-connected-content">
+              {/* Page Selection */}
+              {availablePages.length > 1 && (
+                <div className="page-selector">
+                  <h3>Select a Page</h3>
+                  <div className="pages-grid">
+                    {availablePages.map((page) => (
+                      <div
+                        key={page.id}
+                        className={`page-card ${selectedPage?.id === page.id ? 'selected' : ''}`}
+                        onClick={() => {
+                          setSelectedPage(page);
+                          // Load auto-reply settings for the newly selected page
+                          setTimeout(() => loadAutoReplySettings(), 100);
+                        }}
+                      >
+                        <div className="page-avatar">
+                          {page.profilePicture ? (
+                            <img src={page.profilePicture} alt={page.name} />
+                          ) : (
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                            </svg>
                           )}
                         </div>
-                        <p style={{ 
-                          margin: 0, 
-                          fontSize: '0.875rem', 
-                          color: '#6b7280',
-                          textShadow: 'none'
-                        }}>
-                          {page.category}
-                        </p>
+                        <div className="page-info">
+                          <h4>{page.name}</h4>
+                          <p>{page.category} • {page.followerCount || 0} followers</p>
+                        </div>
                       </div>
-                    </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            )}
-
-            {/* Post Creation Section */}
-            {selectedPage && (
-              <div className="glass-effect" style={{ 
-                padding: '3rem',
-                borderRadius: '30px',
-                background: 'rgba(248, 250, 252, 0.8)',
-                backdropFilter: 'blur(25px)',
-                WebkitBackdropFilter: 'blur(25px)',
-                border: '1px solid rgba(226, 232, 240, 0.8)',
-                boxShadow: '0 20px 40px rgba(0, 0, 0, 0.08)',
-                position: 'relative',
-                zIndex: 1,
-                overflow: 'hidden'
-              }}>
-                {/* Decorative Gradient */}
-                <div style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  height: '4px',
-                  background: 'linear-gradient(90deg, #667eea, #764ba2, #f093fb, #f5576c)',
-                  borderRadius: '30px 30px 0 0'
-                }} />
-
-                {/* Section Header */}
-                <div style={{ 
-                  textAlign: 'center',
-                  marginBottom: '2.5rem'
-                }}>
-                  <h2 style={{
-                    fontSize: '1.75rem',
-                    fontWeight: '700',
-                    color: '#1a202c',
-                    textShadow: 'none',
-                    marginBottom: '0.5rem',
-                    margin: '0 0 0.5rem 0'
-                  }}>
-                    Create New Post
-                  </h2>
-                  <p style={{
-                    fontSize: '1rem',
-                    color: '#4a5568',
-                    textShadow: 'none',
-                    margin: '0'
-                  }}>
-                    Choose AI assistance or create manually for {selectedPage.name}
-                  </p>
                 </div>
+              )}
 
-                {/* Tabs */}
-                <div style={{ 
-                  display: 'flex',
-                  gap: '1rem',
-                  marginBottom: '2.5rem',
-                  justifyContent: 'center',
-                  flexWrap: 'wrap'
-                }}>
-                  {['auto', 'manual', 'schedule'].map(tab => (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      style={{
-                        padding: '1.125rem 2.5rem',
-                        background: activeTab === tab ? 
-                          'linear-gradient(135deg, #667eea, #764ba2)' : 
-                          'rgba(255, 255, 255, 0.3)',
-                        color: activeTab === tab ? '#ffffff' : '#4a5568',
-                        border: activeTab === tab ? 
-                          '2px solid rgba(102, 126, 234, 0.4)' : 
-                          '1px solid rgba(226, 232, 240, 0.8)',
-                        borderRadius: '20px',
-                        cursor: 'pointer',
-                        transition: 'all 0.3s ease',
-                        fontWeight: '700',
-                        fontSize: '1rem',
-                        backdropFilter: 'blur(15px)',
-                        WebkitBackdropFilter: 'blur(15px)',
-                        boxShadow: activeTab === tab ? 
-                          '0 10px 30px rgba(102, 126, 234, 0.4)' : 
-                          '0 6px 20px rgba(0, 0, 0, 0.1)',
-                        textShadow: activeTab === tab ? 
-                          '0 2px 4px rgba(0, 0, 0, 0.2)' : 
-                          '0 1px 2px rgba(0, 0, 0, 0.1)',
-                        transform: activeTab === tab ? 'translateY(-2px)' : 'translateY(0)',
-                        textTransform: 'uppercase',
-                        letterSpacing: '0.5px'
-                      }}
-                      onMouseEnter={(e) => {
-                        if (activeTab !== tab) {
-                          e.target.style.background = 'rgba(248, 250, 252, 0.8)';
-                          e.target.style.transform = 'translateY(-1px)';
-                        }
-                      }}
-                      onMouseLeave={(e) => {
-                        if (activeTab !== tab) {
-                          e.target.style.background = 'rgba(255, 255, 255, 0.3)';
-                          e.target.style.transform = 'translateY(0)';
-                        }
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        {tab === 'auto' ? (
-                          <>
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <circle cx="12" cy="12" r="3"/>
-                              <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
-                            </svg>
-                            AI Assistant
-                          </>
-                        ) : tab === 'manual' ? (
-                          <>
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
-                            </svg>
-                            Manual Mode
-                          </>
-                        ) : (
-                          <>
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <circle cx="12" cy="12" r="10"/>
-                              <polyline points="12,6 12,12 16,14"/>
-                            </svg>
-                            Schedule Posts
-                          </>
+              {/* Main Content Area */}
+              {selectedPage && (
+                <div className="facebook-content-area">
+                  {/* Auto-Reply Settings */}
+                  <div className="auto-reply-section">
+                    <div className="auto-reply-header">
+                      <div className="auto-reply-title">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M8 12h.01"/>
+                          <path d="M12 12h.01"/>
+                          <path d="M16 12h.01"/>
+                          <path d="M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                        </svg>
+                        <span className="auto-reply-label">AI Auto-Reply</span>
+                        <span className={`auto-reply-status ${autoReplySettings.enabled ? 'enabled' : 'disabled'}`}>
+                          {autoReplySettings.enabled ? 'ON' : 'OFF'}
+                        </span>
+                        {autoReplySettings.enabled && autoReplySettings.selectedPostIds.length > 0 && (
+                          <span className="auto-reply-count">
+                            ({autoReplySettings.selectedPostIds.length} post{autoReplySettings.selectedPostIds.length !== 1 ? 's' : ''})
+                          </span>
                         )}
                       </div>
-                    </button>
-                  ))}
-                </div>
-
-                {/* Content Area */}
-                <div style={{ marginBottom: '2rem' }}>
-                  {activeTab === 'auto' ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                      {/* AI Prompt Input */}
-                      <div>
-                        <label style={{ 
-                          marginBottom: '0.5rem', 
-                          fontWeight: '600',
-                          color: '#4a5568',
-                          fontSize: '0.875rem',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.5rem'
-                        }}>
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <div className="auto-reply-controls">
+                        <button
+                          onClick={handleSettingsToggle}
+                          className="btn btn-secondary btn-small"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <circle cx="12" cy="12" r="3"/>
                             <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
                           </svg>
-                          AI Prompt
-                        </label>
-                        <textarea
-                          value={autoFormData.prompt}
-                          onChange={handleAutoInputChange}
-                          name="prompt"
-                          placeholder="Describe what you want to post (e.g., 'cat story', 'motivational Monday', 'product launch')..."
-                          style={{
-                            width: '100%',
-                            minHeight: '80px',
-                            padding: '1rem',
-                            borderRadius: '12px',
-                            border: '2px solid rgba(226, 232, 240, 0.8)',
-                            background: 'rgba(255, 255, 255, 0.9)',
-                            color: '#1a202c',
-                            resize: 'vertical',
-                            fontSize: '1rem',
-                            fontFamily: 'inherit',
-                            transition: 'all 0.3s ease'
-                          }}
-                        />
-                      </div>
-                      
-                      {/* Generated Content Display/Edit */}
-                      {autoFormData.generatedContent && (
-                        <div>
-                          <label style={{ 
-                            marginBottom: '0.5rem', 
-                            fontWeight: '600',
-                            color: '#10b981',
-                            fontSize: '0.875rem',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.5rem'
-                          }}>
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M9 12l2 2 4-4"/>
-                              <path d="M21 12c-1 0-3-1-3-3s2-3 3-3 3 1 3 3-2 3-3 3"/>
-                              <path d="M3 12c1 0 3-1 3-3s-2-3-3-3-3 1-3 3 2 3 3 3"/>
-                              <path d="M3 12h6m12 0h-6"/>
+                          Settings
+                        </button>
+                        <button
+                          onClick={handleAutoReplyToggle}
+                          disabled={autoReplySettings.isLoading || (!autoReplySettings.enabled && autoReplySettings.selectedPostIds.length === 0)}
+                          className={`btn ${autoReplySettings.enabled ? 'btn-danger' : 'btn-success'} btn-small`}
+                        >
+                          {autoReplySettings.isLoading ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M21 12a9 9 0 11-6.219-8.56"/>
                             </svg>
-                            Generated Content (Edit as needed)
-                          </label>
+                          ) : (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M9 12l2 2 4-4"/>
+                            </svg>
+                          )}
+                          {autoReplySettings.isLoading 
+                            ? (isMobile() ? '...' : 'Updating...') 
+                            : (autoReplySettings.enabled ? (isMobile() ? 'Off' : 'Disable') : (isMobile() ? 'On' : 'Enable'))
+                          }
+                        </button>
+                      </div>
+                    </div>
+                    {autoReplySettings.showSettings && (
+                      <div className="auto-reply-settings">
+                        <div className="auto-reply-posts-section">
+                          <div className="auto-reply-posts-header">
+                            <h4>Select Posts for Auto-Reply</h4>
+                            <div className="auto-reply-posts-controls">
+                              <button
+                                onClick={selectAllPosts}
+                                disabled={autoReplySettings.isLoadingPosts}
+                                className="btn btn-secondary btn-small"
+                              >
+                                Select All
+                              </button>
+                              <button
+                                onClick={deselectAllPosts}
+                                disabled={autoReplySettings.isLoadingPosts}
+                                className="btn btn-secondary btn-small"
+                              >
+                                Deselect All
+                              </button>
+                            </div>
+                          </div>
+                          
+                          {autoReplySettings.isLoadingPosts ? (
+                            <div className="loading-posts">
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                              </svg>
+                              Loading posts...
+                            </div>
+                          ) : autoReplySettings.availablePosts.length > 0 ? (
+                            <div className="auto-reply-posts-list">
+                              {autoReplySettings.availablePosts.map((post) => (
+                                <div
+                                  key={post.id}
+                                  className={`auto-reply-post-item ${autoReplySettings.selectedPostIds.includes(post.id) ? 'selected' : ''}`}
+                                  onClick={() => handlePostSelection(post.id)}
+                                  onTouchStart={(e) => handlePostTouch(post.id, e)}
+                                >
+                                  <div className="post-checkbox">
+                                    <input
+                                      type="checkbox"
+                                      checked={autoReplySettings.selectedPostIds.includes(post.id)}
+                                      onChange={() => handlePostSelection(post.id)}
+                                      onClick={(e) => e.stopPropagation()}
+                                    />
+                                  </div>
+                                  <div className="post-content">
+                                    <p className="post-text">{post.content}</p>
+                                    <div className="post-meta">
+                                      <span className="post-date">
+                                        {new Date(post.created_at).toLocaleDateString()}
+                                      </span>
+                                      {post.has_media && (
+                                        <span className="post-media">
+                                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                                            <circle cx="8.5" cy="8.5" r="1.5"/>
+                                            <polyline points="21,15 16,10 5,21"/>
+                                          </svg>
+                                          {post.media_count} media
+                                        </span>
+                                      )}
+                                      <span className={`post-status ${post.status}`}>
+                                        {post.status}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="no-posts-message">
+                              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                              </svg>
+                              <p>No posts found. Create some posts first to enable auto-reply.</p>
+                            </div>
+                          )}
+                        </div>
+                        
+                        <div className="form-group">
+                          <label>AI Response Template (Optional)</label>
                           <textarea
-                            value={autoFormData.generatedContent}
-                            onChange={(e) => setAutoFormData(prev => ({ ...prev, generatedContent: e.target.value }))}
-                            style={{
-                              width: '100%',
-                              minHeight: '140px',
-                              padding: '1.25rem',
-                              borderRadius: '15px',
-                              border: '2px solid rgba(16, 185, 129, 0.3)',
-                              background: 'rgba(16, 185, 129, 0.05)',
-                              color: '#1a202c',
-                              resize: 'vertical',
-                              fontSize: '1rem',
-                              fontFamily: 'inherit',
-                              transition: 'all 0.3s ease'
-                            }}
+                            value={autoReplySettings.template}
+                            onChange={(e) => setAutoReplySettings(prev => ({ ...prev, template: e.target.value }))}
+                            placeholder="e.g., 'Thank you for your comment! We appreciate your engagement.' (Optional - AI will generate contextual replies mentioning the commenter)"
+                            className="form-textarea"
+                            rows="2"
+                          />
+                          <small className="form-helper">
+                            Leave empty for AI-generated contextual replies, or provide a guide for the AI. The AI will always mention the commenter.
+                          </small>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tab Navigation */}
+                  <div className="tab-navigation">
+                    <button
+                      className={`tab-button ${activeTab === 'auto' ? 'active' : ''}`}
+                      onClick={() => setActiveTab('auto')}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                      </svg>
+                      {isMobile() ? 'AI' : 'AI Generate'}
+                    </button>
+                    <button
+                      className={`tab-button ${activeTab === 'manual' ? 'active' : ''}`}
+                      onClick={() => setActiveTab('manual')}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                      </svg>
+                      {isMobile() ? 'Manual' : 'Manual Post'}
+                    </button>
+                    <button
+                      className={`tab-button ${activeTab === 'schedule' ? 'active' : ''}`}
+                      onClick={() => {
+                        console.log('Schedule tab clicked');
+                        setActiveTab('schedule');
+                      }}
+                      style={{ zIndex: 2, position: 'relative' }}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polyline points="12,6 12,12 16,14"/>
+                      </svg>
+                      {isMobile() ? 'Schedule' : 'Schedule'}
+                    </button>
+                  </div>
+
+                  {/* Tab Content */}
+                  <div className="tab-content">
+                    {/* AI Generate Tab */}
+                    {activeTab === 'auto' && (
+                      <div className="auto-post-form">
+                        <h3>AI Content Generation</h3>
+                        
+                        {/* AI Prompt Input */}
+                        <div className="form-group">
+                          <label>Content Prompt</label>
+                          <textarea
+                            name="prompt"
+                            value={autoFormData.prompt}
+                            onChange={handleAutoInputChange}
+                            placeholder="Describe what you want to post about..."
+                            className="form-textarea"
+                            rows="3"
                           />
                         </div>
-                      )}
-                    </div>
-                  ) : activeTab === 'schedule' ? (
-                    /* Simple Schedule Mode */
-                    <div style={{ 
-                      maxWidth: '500px',
-                      margin: '0 auto'
-                    }}>
-                      {/* Simple Header */}
-                      <div style={{
-                        textAlign: 'center',
-                        marginBottom: '2rem'
-                      }}>
-                        <h3 style={{ 
-                          margin: '0 0 0.5rem 0',
-                          color: '#1a202c',
-                          fontSize: '1.5rem',
-                          fontWeight: '700'
-                        }}>
-                          Auto-Post
-                        </h3>
-                        <p style={{ 
-                          margin: '0',
-                          color: '#6b7280',
-                          fontSize: '1rem'
-                        }}>
-                          Set up automatic posts with AI
-                        </p>
-                      </div>
 
-                      {/* Simple Form */}
-                      <div style={{
-                        padding: '2rem',
-                        background: '#fff',
-                        borderRadius: '16px',
-                        border: '1px solid #e5e7eb',
-                        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.05)'
-                      }}>
-                        {/* What to post */}
-                        <div style={{ marginBottom: '1.5rem' }}>
-                          <label style={{ 
-                            display: 'block', 
-                            marginBottom: '0.5rem', 
-                            fontWeight: '600',
-                            color: '#374151',
-                            fontSize: '1rem'
-                          }}>
-                            What should I post?
-                          </label>
+                        {/* Generate Content Button */}
+                        <div className="form-group">
+                          <button
+                            onClick={generatePostContent}
+                            disabled={!autoFormData.prompt.trim() || autoFormData.isGenerating}
+                            className="btn btn-primary"
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                            </svg>
+                            {autoFormData.isGenerating ? 'Generating...' : 'Generate Content'}
+                          </button>
+                        </div>
+
+                        {/* Generated Content Display */}
+                        {autoFormData.generatedContent && (
+                          <div className="form-group">
+                            <label>Generated Content</label>
+                            <textarea
+                              value={autoFormData.generatedContent}
+                              readOnly
+                              className="form-textarea generated-content"
+                              rows="4"
+                            />
+                          </div>
+                        )}
+
+                        {/* Media Options */}
+                        <div className="form-group">
+                          <label>Media Options</label>
+                          <div className="media-options">
+                            <button
+                              type="button"
+                              className={`media-option ${autoFormData.mediaType === 'none' ? 'active' : ''}`}
+                              onClick={() => handleMediaTypeChange('none', 'auto')}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14,2 14,8 20,8"/>
+                                <line x1="16" y1="13" x2="8" y2="13"/>
+                                <line x1="16" y1="17" x2="8" y2="17"/>
+                                <polyline points="10,9 9,9 8,9"/>
+                              </svg>
+                              Text Only
+                            </button>
+                            <button
+                              type="button"
+                              className={`media-option ${autoFormData.mediaType === 'ai_image' ? 'active' : ''}`}
+                              onClick={() => handleMediaTypeChange('ai_image', 'auto')}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                              </svg>
+                              AI Image
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* AI Image Generation */}
+                        {autoFormData.mediaType === 'ai_image' && (
+                          <div className="ai-image-section">
+                            <div className="form-group">
+                              <label>Image Prompt</label>
+                              <input
+                                type="text"
+                                name="imagePrompt"
+                                value={autoFormData.imagePrompt}
+                                onChange={handleAutoInputChange}
+                                placeholder="Describe the image you want to generate..."
+                                className="form-input"
+                              />
+                            </div>
+                            <div className="form-group">
+                              <button
+                                onClick={() => generateImage('auto')}
+                                disabled={!autoFormData.imagePrompt.trim() || autoFormData.isGeneratingImage}
+                                className="btn btn-secondary"
+                              >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                                  <circle cx="8.5" cy="8.5" r="1.5"/>
+                                  <polyline points="21,15 16,10 5,21"/>
+                                </svg>
+                                {autoFormData.isGeneratingImage ? 'Generating...' : 'Generate Image'}
+                              </button>
+                            </div>
+                            {autoFormData.generatedImageUrl && (
+                              <div className="form-group">
+                                <label>Generated Image</label>
+                                <div className="image-preview">
+                                  <img 
+                                    src={autoFormData.generatedImageUrl} 
+                                    alt="Generated" 
+                                    className="preview-image"
+                                  />
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Generate Both Button */}
+                        <div className="form-group">
+                          <button
+                            onClick={generateImageWithCaption}
+                            disabled={!autoFormData.prompt.trim() || autoFormData.isGenerating || autoFormData.isGeneratingImage}
+                            className="btn btn-success"
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                            </svg>
+                            Generate Content + Image
+                          </button>
+                        </div>
+
+                        {/* Publish Button */}
+                        <div className="form-group">
+                          <button
+                            onClick={publishPost}
+                            disabled={!autoFormData.generatedContent || isPublishing}
+                            className="btn btn-primary btn-large"
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M22 2L11 13"/>
+                              <polygon points="22,2 15,22 11,13 2,9"/>
+                            </svg>
+                            {isPublishing ? 'Publishing...' : 'Publish Post'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Manual Post Tab */}
+                    {activeTab === 'manual' && (
+                      <div className="manual-post-form">
+                        <h3>Manual Post</h3>
+                        
+                        {/* Message Input */}
+                        <div className="form-group">
+                          <label>Post Message</label>
+                          <textarea
+                            name="message"
+                            value={manualFormData.message}
+                            onChange={handleManualInputChange}
+                            placeholder="What's on your mind?"
+                            className="form-textarea"
+                            rows="4"
+                          />
+                        </div>
+
+                        {/* Media Options */}
+                        <div className="form-group">
+                          <label>Media Options</label>
+                          <div className="media-options">
+                            <button
+                              type="button"
+                              className={`media-option ${manualFormData.mediaType === 'none' ? 'active' : ''}`}
+                              onClick={() => handleMediaTypeChange('none', 'manual')}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14,2 14,8 20,8"/>
+                                <line x1="16" y1="13" x2="8" y2="13"/>
+                                <line x1="16" y1="17" x2="8" y2="17"/>
+                                <polyline points="10,9 9,9 8,9"/>
+                              </svg>
+                              Text Only
+                            </button>
+                            <button
+                              type="button"
+                              className={`media-option ${manualFormData.mediaType === 'photo' ? 'active' : ''}`}
+                              onClick={() => handleMediaTypeChange('photo', 'manual')}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                                <circle cx="8.5" cy="8.5" r="1.5"/>
+                                <polyline points="21,15 16,10 5,21"/>
+                              </svg>
+                              Upload Photo
+                            </button>
+                            <button
+                              type="button"
+                              className={`media-option ${manualFormData.mediaType === 'video' ? 'active' : ''}`}
+                              onClick={() => handleMediaTypeChange('video', 'manual')}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <polygon points="23,7 16,12 23,17 23,7"/>
+                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+                              </svg>
+                              Upload Video
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Photo Upload */}
+                        {manualFormData.mediaType === 'photo' && (
+                          <div className="form-group">
+                            <label>Upload Photo</label>
+                            <input
+                              type="file"
+                              name="mediaFile"
+                              accept="image/*"
+                              onChange={handleManualInputChange}
+                              className="form-file-input"
+                            />
+                            {manualFormData.mediaFile && (
+                              <div className="image-preview">
+                                <img 
+                                  src={URL.createObjectURL(manualFormData.mediaFile)} 
+                                  alt="Preview" 
+                                  className="preview-image"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Video Upload */}
+                        {manualFormData.mediaType === 'video' && (
+                          <div className="form-group">
+                            <label>Upload Video</label>
+                            <input
+                              type="file"
+                              name="mediaFile"
+                              accept="video/*"
+                              onChange={handleManualInputChange}
+                              className="form-file-input"
+                            />
+                            {manualFormData.mediaFile && (
+                              <div className="video-preview">
+                                <video 
+                                  src={URL.createObjectURL(manualFormData.mediaFile)} 
+                                  controls
+                                  className="preview-video"
+                                  style={{ maxWidth: '100%', maxHeight: '300px' }}
+                                />
+                                <div className="video-info">
+                                  <p>File: {manualFormData.mediaFile.name}</p>
+                                  <p>Size: {(manualFormData.mediaFile.size / (1024 * 1024)).toFixed(2)} MB</p>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Publish Button */}
+                        <div className="form-group">
+                          <button
+                            onClick={publishPost}
+                            disabled={!manualFormData.message.trim() || isPublishing}
+                            className="btn btn-primary btn-large"
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M22 2L11 13"/>
+                              <polygon points="22,2 15,22 11,13 2,9"/>
+                            </svg>
+                            {isPublishing ? 'Publishing...' : 'Publish Post'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Schedule Tab */}
+                    {activeTab === 'schedule' && (
+                      <div className="schedule-form">
+                        <h3>Schedule Posts</h3>
+                        
+                        <div className="form-group">
+                          <label>Content Prompt</label>
                           <textarea
                             value={scheduleData.prompt}
                             onChange={(e) => setScheduleData(prev => ({ ...prev, prompt: e.target.value }))}
-                            placeholder="e.g., motivational quotes, business tips, daily questions..."
-                            style={{
-                              width: '100%',
-                              minHeight: '80px',
-                              padding: '1rem',
-                              borderRadius: '8px',
-                              border: '2px solid #e5e7eb',
-                              background: '#fff',
-                              color: '#1a202c',
-                              resize: 'none',
-                              fontSize: '1rem',
-                              fontFamily: 'inherit'
-                            }}
+                            placeholder="What should be posted automatically?"
+                            className="form-textarea"
+                            rows="3"
                           />
                         </div>
 
-                        {/* When and how often */}
-                        <div style={{ 
-                          display: 'grid',
-                          gridTemplateColumns: '1fr 1fr',
-                          gap: '1rem',
-                          marginBottom: '1.5rem'
-                        }}>
-                          <div>
-                            <label style={{ 
-                              display: 'block', 
-                              marginBottom: '0.5rem', 
-                              fontWeight: '600',
-                              color: '#374151',
-                              fontSize: '1rem'
-                            }}>
-                              When?
-                            </label>
+                        <div className="form-group">
+                          <label>Frequency</label>
+                          <select
+                            value={scheduleData.frequency}
+                            onChange={(e) => setScheduleData(prev => ({ ...prev, frequency: e.target.value }))}
+                            className="form-select"
+                          >
+                            <option value="once">Once</option>
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                            <option value="custom">Selecting a particular date</option>
+                          </select>
+                        </div>
+
+                        {scheduleData.frequency === 'custom' ? (
+                          <div className="form-group">
+                            <label>Custom Date & Time</label>
+                            <input
+                              type="datetime-local"
+                              value={scheduleData.customDate}
+                              onChange={(e) => setScheduleData(prev => ({ ...prev, customDate: e.target.value }))}
+                              className="form-input"
+                            />
+                          </div>
+                        ) : (
+                          <div className="form-group">
+                            <label>Schedule Time</label>
                             <input
                               type="time"
                               value={scheduleData.time}
                               onChange={(e) => setScheduleData(prev => ({ ...prev, time: e.target.value }))}
-                              style={{
-                                width: '100%',
-                                padding: '0.75rem',
-                                borderRadius: '8px',
-                                border: '2px solid #e5e7eb',
-                                background: '#fff',
-                                color: '#1a202c',
-                                fontSize: '1rem'
-                              }}
+                              className="form-input"
                             />
                           </div>
-
-                          <div>
-                            <label style={{ 
-                              display: 'block', 
-                              marginBottom: '0.5rem', 
-                              fontWeight: '600',
-                              color: '#374151',
-                              fontSize: '1rem'
-                            }}>
-                              How often?
-                            </label>
-                            <select
-                              value={scheduleData.frequency}
-                              onChange={(e) => setScheduleData(prev => ({ ...prev, frequency: e.target.value }))}
-                              style={{
-                                width: '100%',
-                                padding: '0.75rem',
-                                borderRadius: '8px',
-                                border: '2px solid #e5e7eb',
-                                background: '#fff',
-                                color: '#1a202c',
-                                fontSize: '1rem'
-                              }}
-                            >
-                              <option value="daily">Daily</option>
-                              <option value="weekly">Weekly</option>
-                              <option value="monthly">Monthly</option>
-                            </select>
-                          </div>
-                        </div>
-
-                        {/* Status and control */}
-                        <div style={{
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
-                          padding: '1rem',
-                          background: scheduleData.isActive ? '#f0fdf4' : '#f9fafb',
-                          borderRadius: '8px',
-                          border: scheduleData.isActive ? '1px solid #bbf7d0' : '1px solid #e5e7eb'
-                        }}>
-                          <div>
-                            <div style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '0.5rem',
-                              marginBottom: '0.25rem'
-                            }}>
-                              <div style={{
-                                width: '8px',
-                                height: '8px',
-                                borderRadius: '50%',
-                                background: scheduleData.isActive ? '#22c55e' : '#9ca3af'
-                              }} />
-                              <span style={{
-                                fontWeight: '600',
-                                color: scheduleData.isActive ? '#166534' : '#6b7280',
-                                fontSize: '1rem'
-                              }}>
-                                {scheduleData.isActive ? 'Active' : 'Inactive'}
-                              </span>
-                            </div>
-                            {scheduleData.isActive && scheduleData.time && (
-                              <p style={{ 
-                                margin: '0',
-                                fontSize: '0.85rem',
-                                color: '#6b7280'
-                              }}>
-                                Posts {scheduleData.frequency} at {scheduleData.time}
-                              </p>
-                            )}
-                          </div>
-
-                          <div style={{ display: 'flex', gap: '0.5rem' }}>
-                            {scheduleData.isActive && (
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    setConnectionStatus('Testing...');
-                                    await apiClient.request('/api/social/scheduled-posts/trigger', { method: 'POST' });
-                                    setConnectionStatus('Test completed');
-                                    setTimeout(() => loadPostHistory(), 1000);
-                                  } catch (error) {
-                                    setConnectionStatus('Test failed: ' + error.message);
-                                  }
-                                }}
-                                style={{
-                                  padding: '0.5rem 0.75rem',
-                                  background: '#3b82f6',
-                                  color: 'white',
-                                  border: 'none',
-                                  borderRadius: '6px',
-                                  cursor: 'pointer',
-                                  fontWeight: '600',
-                                  fontSize: '0.8rem'
-                                }}
-                              >
-                                Test
-                              </button>
-                            )}
-                            
-                            <button
-                              onClick={handleScheduleToggle}
-                              disabled={!scheduleData.prompt || !scheduleData.time}
-                              style={{
-                                padding: '0.75rem 1.5rem',
-                                background: scheduleData.isActive ? '#ef4444' : '#22c55e',
-                                color: 'white',
-                                border: 'none',
-                                borderRadius: '6px',
-                                cursor: (!scheduleData.prompt || !scheduleData.time) ? 'not-allowed' : 'pointer',
-                                fontWeight: '600',
-                                fontSize: '1rem',
-                                opacity: (!scheduleData.prompt || !scheduleData.time) ? 0.5 : 1,
-                                minWidth: '80px'
-                              }}
-                            >
-                              {scheduleData.isActive ? 'Stop' : 'Start'}
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    /* Manual Mode */
-                    <div>
-                      <label style={{ 
-                        marginBottom: '0.5rem', 
-                        fontWeight: '600',
-                        color: '#4a5568',
-                        fontSize: '0.875rem',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '0.5rem'
-                      }}>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
-                        </svg>
-                        Post Content
-                      </label>
-                      <textarea
-                        value={manualFormData.message}
-                        onChange={handleManualInputChange}
-                        name="message"
-                        placeholder="Write your post content here..."
-                        style={{
-                          width: '100%',
-                          minHeight: '140px',
-                          padding: '1.25rem',
-                          borderRadius: '15px',
-                          border: '2px solid rgba(226, 232, 240, 0.8)',
-                          background: 'rgba(255, 255, 255, 0.9)',
-                          color: '#1a202c',
-                          resize: 'vertical',
-                          fontSize: '1rem',
-                          transition: 'all 0.3s ease',
-                          fontFamily: 'inherit'
-                        }}
-                      />
-                    </div>
-                  )}
-                </div>
-
-                {/* Media Options - Only show for auto and manual modes */}
-                {activeTab !== 'schedule' && (
-                <div style={{ 
-                  display: 'flex',
-                  gap: '1rem',
-                  marginBottom: '2rem',
-                  flexWrap: 'wrap'
-                }}>
-                  {['none', 'photo'].map(type => (
-                    <button
-                      key={type}
-                      onClick={() => handleMediaTypeChange(type, activeTab)}
-                      style={{
-                        padding: '0.875rem 1.25rem',
-                        background: (activeTab === 'auto' ? autoFormData.mediaType : manualFormData.mediaType) === type ?
-                          'rgba(16, 185, 129, 0.8)' :
-                          'rgba(248, 250, 252, 0.8)',
-                        border: 'none',
-                        borderRadius: '15px',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '0.5rem',
-                        color: (activeTab === 'auto' ? autoFormData.mediaType : manualFormData.mediaType) === type ? 'white' : '#4a5568',
-                        transition: 'all 0.3s ease',
-                        fontWeight: '600',
-                        backdropFilter: 'blur(10px)',
-                        WebkitBackdropFilter: 'blur(10px)',
-                        boxShadow: (activeTab === 'auto' ? autoFormData.mediaType : manualFormData.mediaType) === type ?
-                          '0 8px 25px rgba(16, 185, 129, 0.4)' :
-                          '0 4px 15px rgba(0, 0, 0, 0.1)'
-                      }}
-                    >
-                      <MediaIcon type={type} />
-                      {type === 'none' ? 'Text Only' : type.charAt(0).toUpperCase() + type.slice(1)}
-                    </button>
-                  ))}
-                </div>
-                )}
-
-                {/* Action Buttons - Only show for auto and manual modes */}
-                {activeTab !== 'schedule' && (
-                <div style={{ 
-                  display: 'flex',
-                  gap: '1rem',
-                  justifyContent: 'flex-end',
-                  flexWrap: 'wrap'
-                }}>
-                  {activeTab === 'auto' && (
-                    <button
-                      onClick={generatePostContent}
-                      disabled={autoFormData.isGenerating || !autoFormData.prompt.trim()}
-                      style={{
-                        padding: '1rem 2rem',
-                        background: autoFormData.isGenerating ? 
-                          'rgba(16, 185, 129, 0.6)' : 
-                          'linear-gradient(135deg, #10b981, #059669)',
-                        color: 'white',
-                        border: 'none',
-                        borderRadius: '15px',
-                        cursor: 'pointer',
-                        opacity: autoFormData.isGenerating || !autoFormData.prompt.trim() ? 0.6 : 1,
-                        transition: 'all 0.3s ease',
-                        fontWeight: '600',
-                        fontSize: '1rem',
-                        boxShadow: '0 8px 25px rgba(16, 185, 129, 0.4)',
-                        transform: autoFormData.isGenerating ? 'scale(0.95)' : 'scale(1)'
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        {autoFormData.isGenerating ? (
-                          <>
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
-                              <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                            </svg>
-                            Generating...
-                          </>
-                        ) : (
-                          <>
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <circle cx="12" cy="12" r="3"/>
-                              <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
-                            </svg>
-                            Generate Content
-                          </>
                         )}
-                      </div>
-                    </button>
-                  )}
-                  
-                  <button
-                    onClick={publishPost}
-                    disabled={isPublishing || (activeTab === 'auto' ? !autoFormData.generatedContent : !manualFormData.message)}
-                    style={{
-                      padding: '1rem 2rem',
-                      background: isPublishing ? 
-                        'rgba(59, 130, 246, 0.6)' : 
-                        'linear-gradient(135deg, #3b82f6, #2563eb)',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '15px',
-                      cursor: 'pointer',
-                      opacity: isPublishing || (activeTab === 'auto' ? !autoFormData.generatedContent : !manualFormData.message) ? 0.6 : 1,
-                      transition: 'all 0.3s ease',
-                      fontWeight: '600',
-                      fontSize: '1rem',
-                      boxShadow: '0 8px 25px rgba(59, 130, 246, 0.4)',
-                      transform: isPublishing ? 'scale(0.95)' : 'scale(1)'
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      {isPublishing ? (
-                        <>
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
-                            <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                          </svg>
-                          Publishing...
-                        </>
-                      ) : (
-                        <>
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M12 19V5m-7 7l7-7 7 7"/>
-                          </svg>
-                          Publish Post
-                        </>
-                      )}
-                    </div>
-                  </button>
-                </div>
-                )}
-              </div>
-            )}
-            
-            {/* Posts History Section */}
-            {selectedPage && facebookConnected && (
-              <div className="glass-effect" style={{ 
-                marginTop: '3rem',
-                padding: '2rem',
-                borderRadius: '25px',
-                background: 'rgba(248, 250, 252, 0.8)',
-                backdropFilter: 'blur(20px)',
-                WebkitBackdropFilter: 'blur(20px)',
-                border: '1px solid rgba(226, 232, 240, 0.8)',
-                boxShadow: '0 15px 30px rgba(0, 0, 0, 0.05)',
-                position: 'relative',
-                zIndex: 1,
-                maxWidth: '1000px',
-                width: '100%'
-              }}>
-                {/* Section Header */}
-                <div style={{ 
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  marginBottom: '2rem'
-                }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                    <div style={{
-                      padding: '0.75rem',
-                      borderRadius: '12px',
-                      background: 'rgba(59, 130, 246, 0.1)',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center'
-                    }}>
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2">
-                        <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
-                      </svg>
-                    </div>
-                    <div>
-                      <h3 style={{
-                        fontSize: '1.5rem',
-                        fontWeight: '700',
-                        color: '#1a202c',
-                        margin: '0'
-                      }}>
-                        Recent Posts
-                      </h3>
-                      <p style={{
-                        fontSize: '0.875rem',
-                        color: '#6b7280',
-                        margin: '0'
-                      }}>
-                        Your latest Facebook posts from {selectedPage.name}
-                      </p>
-                    </div>
-                  </div>
-                  
-                  <button
-                    onClick={loadPostHistory}
-                    disabled={isLoadingPosts}
-                    style={{
-                      padding: '0.75rem 1.5rem',
-                      background: 'rgba(59, 130, 246, 0.1)',
-                      border: '1px solid rgba(59, 130, 246, 0.2)',
-                      borderRadius: '12px',
-                      color: '#3b82f6',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.5rem',
-                      fontWeight: '600',
-                      fontSize: '0.875rem',
-                      transition: 'all 0.3s ease',
-                      opacity: isLoadingPosts ? 0.7 : 1
-                    }}
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M23 4v6h-6"/>
-                      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                    </svg>
-                    {isLoadingPosts ? 'Loading...' : 'Refresh'}
-                  </button>
-                </div>
 
-                {/* Posts List */}
-                <div style={{ 
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '1rem'
-                }}>
-                  {isLoadingPosts ? (
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      padding: '3rem',
-                      color: '#6b7280'
-                    }}>
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
-                        <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                      </svg>
-                      <span style={{ marginLeft: '0.75rem' }}>Loading posts...</span>
-                    </div>
-                  ) : postHistory.length === 0 ? (
-                    <div style={{
-                      textAlign: 'center',
-                      padding: '3rem',
-                      color: '#6b7280'
-                    }}>
-                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" style={{ margin: '0 auto 1rem auto' }}>
-                        <circle cx="12" cy="12" r="10"/>
-                        <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
-                        <line x1="9" y1="9" x2="9.01" y2="9"/>
-                        <line x1="15" y1="9" x2="15.01" y2="9"/>
-                      </svg>
-                      <p style={{ margin: '0', fontSize: '1.1rem', fontWeight: '600' }}>No posts yet</p>
-                      <p style={{ margin: '0.5rem 0 0 0', fontSize: '0.875rem' }}>Your published posts will appear here</p>
-                    </div>
-                  ) : (
-                    postHistory.map((post, index) => (
-                      <div
-                        key={post.id || index}
-                        style={{
-                          padding: '1.5rem',
-                          background: 'rgba(255, 255, 255, 0.8)',
-                          borderRadius: '15px',
-                          border: '1px solid rgba(226, 232, 240, 0.8)',
-                          transition: 'all 0.3s ease'
-                        }}
+                        <div className="form-group">
+                          <button
+                            onClick={handleScheduleToggle}
+                            disabled={isTogglingSchedule}
+                            className={`btn ${scheduleData.isActive ? 'btn-danger' : 'btn-success'} btn-large`}
+                          >
+                            {isTogglingSchedule ? (
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                              </svg>
+                            ) : (
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <polyline points="12,6 12,12 16,14"/>
+                              </svg>
+                            )}
+                            {isTogglingSchedule 
+                              ? (scheduleData.isActive ? 'Deactivating...' : 'Activating...') 
+                              : (scheduleData.isActive ? 'Deactivate Schedule' : 'Activate Schedule')
+                            }
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Post History */}
+                  <div className="post-history">
+                    <div className="post-history-header">
+                      <h3>
+                        {activeTab === 'auto' && `AI Generated Posts (${autoPostHistory.length})`}
+                        {activeTab === 'manual' && `Manual Posts (${manualPostHistory.length})`}
+                        {activeTab === 'schedule' && `Scheduled Posts (${scheduleTotalCount})`}
+                      </h3>
+                      <button
+                        onClick={activeTab === 'schedule' ? () => loadScheduledPosts(1) : loadPostHistory}
+                        disabled={isLoadingPosts}
+                        className="btn btn-secondary btn-small"
                       >
-                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '1rem' }}>
-                          <div style={{
-                            width: '40px',
-                            height: '40px',
-                            borderRadius: '50%',
-                            background: 'rgba(24, 119, 242, 0.2)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            flexShrink: 0
-                          }}>
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="#1877f2">
-                              <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
-                            </svg>
-                          </div>
-                          <div style={{ flex: 1 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                              <span style={{ fontWeight: '600', color: '#1a202c' }}>{selectedPage.name}</span>
-                              <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>
-                                {post.created_at ? new Date(post.created_at).toLocaleDateString() : 'Recently'}
-                              </span>
-                              <div style={{
-                                padding: '0.25rem 0.5rem',
-                                background: post.status === 'published' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(156, 163, 175, 0.1)',
-                                color: post.status === 'published' ? '#065f46' : '#374151',
-                                borderRadius: '6px',
-                                fontSize: '0.75rem',
-                                fontWeight: '600'
-                              }}>
-                                {post.status || 'Published'}
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M23 4v6h-6"/>
+                          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                        </svg>
+                        Refresh
+                      </button>
+                    </div>
+                    
+                    {isLoadingPosts ? (
+                      <div className="loading-posts">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                        </svg>
+                        Loading posts...
+                      </div>
+                    ) : getCurrentPostHistory().length > 0 ? (
+                      <>
+                        <div className="posts-list">
+                          {getCurrentPostHistory().map((post, index) => (
+                            <div key={index} className="post-item">
+                              <div className="post-content">
+                                {activeTab === 'schedule' ? (
+                                  // Special display for scheduled posts
+                                  <div className="scheduled-post-content">
+                                    <div className="schedule-info">
+                                      <span className="schedule-frequency">
+                                        {post.frequency} • {post.post_time}
+                                      </span>
+                                      <span className={`schedule-status ${post.is_active ? 'active' : 'inactive'}`}>
+                                        {post.is_active ? 'Active' : 'Inactive'}
+                                      </span>
+                                    </div>
+                                    <p className="schedule-prompt">{post.prompt}</p>
+                                    {post.next_execution && (
+                                      <div className="next-execution">
+                                        Next: {new Date(post.next_execution).toLocaleString()}
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  // Regular post display
+                                  <>
+                                    <p>{post.content}</p>
+                                    {post.media_urls && post.media_urls.length > 0 && (
+                                      <div className="post-media">
+                                        <img src={post.media_urls[0]} alt="Post media" className="post-image" />
+                                      </div>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                              <div className="post-meta">
+                                <span className="post-date">
+                                  {new Date(post.created_at || post.next_execution).toLocaleDateString()}
+                                </span>
+                                {activeTab !== 'schedule' && (
+                                  <span className={`post-status ${post.status}`}>
+                                    {post.status}
+                                  </span>
+                                )}
                               </div>
                             </div>
-                            <p style={{ 
-                              margin: '0',
-                              color: '#374151',
-                              lineHeight: '1.5',
-                              fontSize: '0.95rem'
-                            }}>
-                              {post.content || post.message || 'Post content not available'}
-                            </p>
-                          </div>
+                          ))}
                         </div>
+                        
+                        {/* Pagination for scheduled posts */}
+                        {activeTab === 'schedule' && scheduleTotalPages > 1 && (
+                          <div className="pagination">
+                            <button
+                              onClick={() => loadScheduledPosts(schedulePage - 1)}
+                              disabled={schedulePage <= 1}
+                              className="btn btn-secondary btn-small"
+                            >
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <polyline points="15,18 9,12 15,6"/>
+                              </svg>
+                              Previous
+                            </button>
+                            
+                            <span className="pagination-info">
+                              Page {schedulePage} of {scheduleTotalPages}
+                            </span>
+                            
+                            <button
+                              onClick={() => loadScheduledPosts(schedulePage + 1)}
+                              disabled={schedulePage >= scheduleTotalPages}
+                              className="btn btn-secondary btn-small"
+                            >
+                              Next
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <polyline points="9,18 15,12 9,6"/>
+                              </svg>
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="no-posts">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
+                          {activeTab === 'schedule' ? (
+                            <circle cx="12" cy="12" r="10"/>
+                          ) : (
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                          )}
+                        </svg>
+                        <p>
+                          {activeTab === 'schedule' 
+                            ? 'No scheduled posts yet. Create your first schedule!' 
+                            : 'No posts yet. Create your first post!'
+                          }
+                        </p>
                       </div>
-                    ))
-                  )}
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* File Picker Modal */}
+      {showFilePicker && (
+        <div className="modal-overlay" onClick={closeFilePicker}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Select {filePickerType === 'photo' ? 'Photo' : 'Video'}</h3>
+              <button onClick={closeFilePicker} className="modal-close">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18"/>
+                  <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="file-picker-options">
+                <div 
+                  className="file-option" 
+                  onClick={() => document.getElementById('local-file-input').click()}
+                  onTouchStart={(e) => e.preventDefault()}
+                >
+                  <div className="file-option-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                      <polyline points="14,2 14,8 20,8"/>
+                      <line x1="16" y1="13" x2="8" y2="13"/>
+                      <line x1="16" y1="17" x2="8" y2="17"/>
+                      <polyline points="10,9 9,9 8,9"/>
+                    </svg>
+                  </div>
+                  <div className="file-option-content">
+                    <h4>Local System</h4>
+                    <p>Select a file from your computer</p>
+                  </div>
+                </div>
+                
+                <div 
+                  className={`file-option ${!googleDriveAvailable ? 'disabled' : ''}`} 
+                  onClick={handleGoogleDriveSelect}
+                  onTouchStart={(e) => {
+                    if (!googleDriveAvailable) {
+                      e.preventDefault();
+                      return;
+                    }
+                    e.preventDefault();
+                    handleGoogleDriveSelect();
+                  }}
+                >
+                  <div className="file-option-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                      <polyline points="9,22 9,12 15,12 15,22"/>
+                    </svg>
+                  </div>
+                  <div className="file-option-content">
+                    <h4>Google Drive</h4>
+                    <p>
+                      {googleDriveAvailable 
+                        ? 'Select a file from your Google Drive' 
+                        : 'Google Drive not configured. See setup guide.'
+                      }
+                    </p>
+                    {isLoadingGoogleDrive && (
+                      <div className="loading-indicator">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                        </svg>
+                        Loading...
+                      </div>
+                    )}
+                    {!googleDriveAvailable && (
+                      <div className="unavailable-indicator">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10"/>
+                          <line x1="15" y1="9" x2="9" y2="15"/>
+                          <line x1="9" y1="9" x2="15" y2="15"/>
+                        </svg>
+                        Not Available
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
-            )}
+              
+              {/* Hidden file input for local file selection */}
+              <input
+                id="local-file-input"
+                type="file"
+                accept={filePickerType === 'photo' ? 'image/*' : 'video/*'}
+                onChange={handleLocalFileSelect}
+                style={{ display: 'none' }}
+              />
+            </div>
           </div>
-        )}
-      </div>
-      
-      <style jsx>{`
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-        
-        @keyframes pulse {
-          0%, 100% {
-            opacity: 1;
-            transform: scale(1);
-          }
-          50% {
-            opacity: 0.7;
-            transform: scale(1.2);
-          }
-        }
-      `}</style>
-             </div>
+        </div>
+      )}
     </div>
   );
 }
